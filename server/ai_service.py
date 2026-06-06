@@ -5,12 +5,16 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
 from openai import OpenAI
 
 try:
     from ai_cache import AICache
 except ImportError:
     from server.ai_cache import AICache
+
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 class AIService:
@@ -22,77 +26,33 @@ class AIService:
         "tone": "gpt-5-nano",
     }
 
-    PROMPT_VERSION = "2026-05-product-ai-v4-learning-corrections"
+    PROMPT_VERSION = "2026-06-yunseo-spelling-v1"
 
-    FEATURE_SPECS = {
-        "correction": {
-            "json_keys": ("corrected_text", "feedback", "corrections"),
-            "instructions": (
-                "You are a Korean writing tutor and editor. Correct spelling, spacing, grammar, "
-                "punctuation, and awkward wording while preserving meaning, paragraph order, "
-                "and blank lines. Also identify each likely issue as a learning aid. "
-                "Return only valid JSON with keys corrected_text, feedback, and corrections. "
-                "corrections must be an array of objects with original, suggestion, category, "
-                "explanation, and confidence. Use concise Korean explanations. If there are no "
-                "clear issues, return an empty corrections array."
-            ),
-            "task": (
-                "다음 글을 교정하고, 오류 또는 오류 가능성이 있는 부분별로 교정안과 이유를 알려 주세요. "
-                "의미를 바꾸지 말고 JSON 객체만 반환하세요."
-            ),
-        },
-        "summary": {
-            "json_keys": ("summary",),
-            "instructions": (
-                "You are a Korean writing assistant. Summarize the user's text in Korean. "
-                "Preserve the writer's intent, avoid adding facts, and keep the result concise. "
-                "Do not copy the source verbatim unless it is already a very short sentence. "
-                "Return only valid JSON with key summary."
-            ),
-            "task": "다음 글의 핵심을 2~4문장으로 요약해 주세요. JSON 객체만 반환하세요.",
-        },
-        "evaluation": {
-            "json_keys": ("score", "feedback"),
-            "instructions": (
-                "You are a Korean writing coach. Evaluate clarity, coherence, grammar, "
-                "readability, and persuasiveness. Return only valid JSON with keys score "
-                "and feedback. score must be an integer from 0 to 100. feedback must be "
-                "short, practical Korean advice."
-            ),
-            "task": "다음 글을 평가해 주세요. JSON 객체만 반환하세요.",
-        },
-        "title": {
-            "json_keys": ("title",),
-            "instructions": (
-                "You are a Korean editor. Recommend one concise title for the user's text. "
-                "Return only valid JSON with key title. The title should be natural, "
-                "specific, and no longer than 40 Korean characters unless necessary."
-            ),
-            "task": "다음 글에 어울리는 제목 하나를 추천해 주세요. JSON 객체만 반환하세요.",
-        },
-        "tone": {
-            "json_keys": ("converted_text", "feedback"),
-            "instructions": (
-                "You are a Korean rewriting assistant. Rewrite the user's text into the "
-                "requested tone or style while preserving meaning, facts, paragraph order, "
-                "and blank lines. Return only valid JSON with keys converted_text and feedback."
-            ),
-            "task": "다음 글을 요청한 문체/말투로 변환해 주세요. JSON 객체만 반환하세요.",
-        },
-    }
+    CORRECTION_INSTRUCTIONS = (
+        "You are a Korean writing tutor and editor. Correct spelling, spacing, grammar, "
+        "punctuation, and awkward wording while preserving meaning, paragraph order, "
+        "and blank lines. Also identify each likely issue as a learning aid. "
+        "Return only valid JSON with keys corrected_text, feedback, and corrections. "
+        "corrections must be an array of objects with original, suggestion, category, "
+        "explanation, and confidence. Use concise Korean explanations. If there are no "
+        "clear issues, return an empty corrections array."
+    )
 
     def __init__(self):
         self._client = None
-        cache_path = Path(__file__).resolve().parents[1] / ".logs" / "ai_response_cache.json"
-        self.event_log_path = Path(__file__).resolve().parents[1] / ".logs" / "ai_events.jsonl"
-        self.cache = AICache(cache_path, max_entries=self._env_int("OPENAI_CACHE_MAX_ENTRIES", 300))
+        root = Path(__file__).resolve().parents[1]
+        self.event_log_path = root / ".logs" / "ai_events.jsonl"
+        self.cache = AICache(
+            root / ".logs" / "ai_response_cache.json",
+            max_entries=self._env_int("OPENAI_CACHE_MAX_ENTRIES", 300),
+        )
 
     @property
     def client(self):
         if self._client is None:
             api_key = os.getenv("OPENAI_API_KEY", "").strip()
             if not api_key:
-                raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
+                raise RuntimeError("OPENAI_API_KEY is not set in server/.env or environment.")
             self._client = OpenAI(api_key=api_key)
         return self._client
 
@@ -105,62 +65,11 @@ class AIService:
             or "gpt-5-nano"
         ).strip()
 
-    def correct_text(self, text: str) -> dict[str, str]:
+    def correct_text(self, text: str) -> dict[str, object]:
         source_text = self._require_text(text)
-        data = self._run_json_feature("correction", source_text)
-        corrected_text = str(data.get("corrected_text") or "").strip()
-        if not corrected_text:
-            raise RuntimeError("OpenAI correction response did not include corrected_text.")
-        return {
-            "corrected_text": corrected_text,
-            "feedback": str(data.get("feedback") or "").strip(),
-            "corrections": self._normalize_corrections(data.get("corrections"), source_text),
-        }
-
-    def summarize_text(self, text: str) -> dict[str, str]:
-        source_text = self._require_text(text)
-        data = self._run_json_feature("summary", source_text)
-        summary = str(data.get("summary") or "").strip()
-        if not summary:
-            raise RuntimeError("OpenAI summary response did not include summary.")
-        return {"summary": summary}
-
-    def evaluate_text(self, text: str) -> dict[str, object]:
-        source_text = self._require_text(text)
-        data = self._run_json_feature("evaluation", source_text)
-        feedback = str(data.get("feedback") or "").strip()
-        if not feedback:
-            raise RuntimeError("OpenAI evaluation response did not include feedback.")
-        return {
-            "score": self._clamp_score(data.get("score")),
-            "feedback": feedback,
-        }
-
-    def recommend_title(self, text: str) -> dict[str, str]:
-        source_text = self._require_text(text)
-        data = self._run_json_feature("title", source_text)
-        title = str(data.get("title") or "").strip().strip("\"' \n\t")
-        if not title:
-            raise RuntimeError("OpenAI title response did not include title.")
-        return {"title": title}
-
-    def convert_tone(self, text: str, tone: str = "") -> dict[str, str]:
-        source_text = self._require_text(text)
-        requested_tone = str(tone or "").strip() or "자연스럽고 읽기 쉬운 문체"
-        data = self._run_json_feature("tone", source_text, {"tone": requested_tone})
-        converted_text = str(data.get("converted_text") or "").strip()
-        if not converted_text:
-            raise RuntimeError("OpenAI tone response did not include converted_text.")
-        return {
-            "converted_text": converted_text,
-            "feedback": str(data.get("feedback") or "").strip(),
-        }
-
-    def _run_json_feature(self, feature: str, source_text: str, extra: dict | None = None) -> dict:
-        spec = self.FEATURE_SPECS[feature]
-        model = self.model_for(feature)
-        input_text = self._build_input(feature, spec, source_text, extra or {})
-        cache_key = self._cache_key(feature, model, input_text)
+        model = self.model_for("correction")
+        input_text = self._build_correction_input(source_text)
+        cache_key = self._cache_key("correction", model, input_text)
         started_at = time.monotonic()
 
         if self._cache_enabled():
@@ -168,99 +77,74 @@ class AIService:
             if cached is not None:
                 self._log_ai_event(
                     "ai_cache_hit",
-                    feature=feature,
+                    feature="correction",
                     model=model,
                     duration_ms=int((time.monotonic() - started_at) * 1000),
                     **self._text_ref(source_text),
                 )
-                return cached
+                return self._normalize_correction_result(cached, source_text)
 
-        response = self._create_json_response(feature, spec, model, input_text, source_text)
+        response = self._create_correction_response(model, input_text, source_text)
         output_text = self._extract_response_text(response)
-        self._raise_for_empty_or_incomplete_response(feature, response, output_text)
+        self._raise_for_empty_or_incomplete_response(response, output_text)
         data = self._parse_json_object(output_text)
         if not data:
             self._log_ai_event(
                 "ai_json_parse_failed",
-                feature=feature,
+                feature="correction",
                 model=model,
                 output_len=len(output_text),
                 output_preview=output_text[:160],
                 **self._text_ref(source_text),
             )
-            raise RuntimeError(f"OpenAI {feature} response was not valid JSON.")
+            raise RuntimeError("OpenAI correction response was not valid JSON.")
 
         if self._cache_enabled():
             self.cache.set(cache_key, data)
         self._log_ai_event(
             "ai_request_completed",
-            feature=feature,
+            feature="correction",
             model=model,
             duration_ms=int((time.monotonic() - started_at) * 1000),
             output_len=len(output_text),
             response_status=str(getattr(response, "status", "") or ""),
             **self._text_ref(source_text),
         )
-        return data
+        return self._normalize_correction_result(data, source_text)
 
-    def _build_input(self, feature: str, spec: dict, source_text: str, extra: dict) -> str:
-        trimmed_text = self._trim_input(source_text)
-        lines = [spec["task"]]
-        if feature == "tone":
-            lines.append(f"요청 문체/말투: {extra.get('tone') or '자연스럽게'}")
-        lines.extend(["", "원문:", trimmed_text])
-        return "\n".join(lines)
+    def summarize_text(self, text: str) -> dict[str, str]:
+        raise NotImplementedError("Summary AI is not enabled in this build.")
 
-    def _json_schema_format(self, feature: str, spec: dict) -> dict:
-        properties = {}
-        for key in spec["json_keys"]:
-            if key == "score":
-                properties[key] = {"type": "integer"}
-            elif key == "corrections":
-                properties[key] = {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "original": {"type": "string"},
-                            "suggestion": {"type": "string"},
-                            "category": {"type": "string"},
-                            "explanation": {"type": "string"},
-                            "confidence": {"type": "string"},
-                        },
-                        "required": [
-                            "original",
-                            "suggestion",
-                            "category",
-                            "explanation",
-                            "confidence",
-                        ],
-                        "additionalProperties": False,
-                    },
-                }
-            else:
-                properties[key] = {"type": "string"}
-        return {
-            "type": "json_schema",
-            "name": f"writing_assistant_{feature}",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "properties": properties,
-                "required": list(spec["json_keys"]),
-                "additionalProperties": False,
-            },
-        }
+    def evaluate_text(self, text: str) -> dict[str, object]:
+        raise NotImplementedError("Evaluation AI is not enabled in this build.")
 
-    def _create_json_response(self, feature: str, spec: dict, model: str, input_text: str, source_text: str):
+    def recommend_title(self, text: str) -> dict[str, str]:
+        raise NotImplementedError("Title AI is not enabled in this build.")
+
+    def convert_tone(self, text: str, tone: str = "") -> dict[str, str]:
+        raise NotImplementedError("Tone AI is not enabled in this build.")
+
+    def _build_correction_input(self, source_text: str) -> str:
+        return "\n".join(
+            [
+                "다음 글을 교정하고, 오류 또는 오류 가능성이 있는 부분별로 교정안과 이유를 알려 주세요.",
+                "의미를 바꾸지 말고, 줄바꿈과 빈 줄을 가능한 한 보존하세요.",
+                "JSON 객체만 반환하세요.",
+                "",
+                "원문:",
+                self._trim_input(source_text),
+            ]
+        )
+
+    def _create_correction_response(self, model: str, input_text: str, source_text: str):
         params = {
             "model": model,
-            "instructions": spec["instructions"],
+            "instructions": self.CORRECTION_INSTRUCTIONS,
             "input": input_text,
-            "max_output_tokens": self._env_int("OPENAI_MAX_OUTPUT_TOKENS", 700),
+            "max_output_tokens": self._env_int("OPENAI_MAX_OUTPUT_TOKENS", 900),
             "reasoning": {"effort": "minimal"},
             "text": {
-                "format": self._json_schema_format(feature, spec),
+                "format": self._correction_schema_format(),
                 "verbosity": "low",
             },
         }
@@ -269,7 +153,7 @@ class AIService:
         except Exception as exc:
             self._log_ai_event(
                 "ai_json_schema_request_failed",
-                feature=feature,
+                feature="correction",
                 model=model,
                 error_type=type(exc).__name__,
                 error=str(exc)[:240],
@@ -281,55 +165,52 @@ class AIService:
             }
             return self.client.responses.create(**params)
 
-    def _extract_response_text(self, response) -> str:
-        texts = []
-        output_text = str(getattr(response, "output_text", "") or "")
-        if output_text:
-            texts.append(output_text)
-        for item in getattr(response, "output", []) or []:
-            for content in getattr(item, "content", []) or []:
-                text = getattr(content, "text", None)
-                if text:
-                    texts.append(str(text))
-                parsed = getattr(content, "parsed", None)
-                if parsed:
-                    try:
-                        texts.append(json.dumps(parsed, ensure_ascii=False))
-                    except Exception:
-                        pass
-        return "\n".join(part for part in texts if part).strip()
+    def _correction_schema_format(self) -> dict:
+        return {
+            "type": "json_schema",
+            "name": "writing_assistant_correction",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "corrected_text": {"type": "string"},
+                    "feedback": {"type": "string"},
+                    "corrections": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "original": {"type": "string"},
+                                "suggestion": {"type": "string"},
+                                "category": {"type": "string"},
+                                "explanation": {"type": "string"},
+                                "confidence": {"type": "string"},
+                            },
+                            "required": [
+                                "original",
+                                "suggestion",
+                                "category",
+                                "explanation",
+                                "confidence",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["corrected_text", "feedback", "corrections"],
+                "additionalProperties": False,
+            },
+        }
 
-    def _raise_for_empty_or_incomplete_response(self, feature: str, response, output_text: str):
-        status = str(getattr(response, "status", "") or "")
-        incomplete = getattr(response, "incomplete_details", None)
-        error = getattr(response, "error", None)
-        reason = str(getattr(incomplete, "reason", "") or "")
-        error_message = str(getattr(error, "message", "") or "")
-        if status == "incomplete" or reason:
-            self._log_ai_event(
-                "ai_response_incomplete",
-                feature=feature,
-                status=status,
-                reason=reason,
-                output_len=len(output_text),
-            )
-            raise RuntimeError(f"OpenAI response was incomplete: {reason or status}")
-        if error_message:
-            self._log_ai_event(
-                "ai_response_error",
-                feature=feature,
-                status=status,
-                error=error_message[:240],
-            )
-            raise RuntimeError(f"OpenAI response error: {error_message}")
-        if not output_text:
-            self._log_ai_event(
-                "ai_response_empty",
-                feature=feature,
-                status=status,
-                output_items=len(getattr(response, "output", []) or []),
-            )
-            raise RuntimeError("OpenAI returned an empty response.")
+    def _normalize_correction_result(self, data: dict, source_text: str) -> dict[str, object]:
+        corrected_text = str(data.get("corrected_text") or "").strip()
+        if not corrected_text:
+            raise RuntimeError("OpenAI correction response did not include corrected_text.")
+        return {
+            "corrected_text": corrected_text,
+            "feedback": str(data.get("feedback") or "").strip(),
+            "corrections": self._normalize_corrections(data.get("corrections"), source_text),
+        }
 
     def _normalize_corrections(self, value, source_text: str) -> list[dict[str, object]]:
         if not isinstance(value, list):
@@ -347,10 +228,9 @@ class AIService:
             start, end = self._find_correction_span(source_text, original, cursor)
             if start is not None and end is not None:
                 cursor = end
-            correction_id = f"spell-{len(corrections) + 1:02d}"
             category = str(item.get("category") or "").strip()
             confidence = str(item.get("confidence") or "").strip()
-            anchor_text = original or suggestion
+            correction_id = f"spell-{len(corrections) + 1:02d}"
             corrections.append(
                 {
                     "id": correction_id,
@@ -362,7 +242,7 @@ class AIService:
                     "severity": self._correction_severity(category, confidence),
                     "source_start": start,
                     "source_end": end,
-                    "anchor_text": anchor_text,
+                    "anchor_text": original or suggestion,
                     "display_title": self._correction_display_title(category, original, suggestion),
                 }
             )
@@ -393,6 +273,60 @@ class AIService:
         if original and suggestion:
             return f"{label}: {original} -> {suggestion}"
         return label
+
+    def _extract_response_text(self, response) -> str:
+        texts = []
+        output_text = str(getattr(response, "output_text", "") or "")
+        if output_text:
+            texts.append(output_text)
+        for item in getattr(response, "output", []) or []:
+            for content in getattr(item, "content", []) or []:
+                text = getattr(content, "text", None)
+                if text:
+                    texts.append(str(text))
+                parsed = getattr(content, "parsed", None)
+                if parsed:
+                    try:
+                        texts.append(json.dumps(parsed, ensure_ascii=False))
+                    except Exception:
+                        pass
+        return "\n".join(part for part in texts if part).strip()
+
+    def _raise_for_empty_or_incomplete_response(self, response, output_text: str):
+        status = str(getattr(response, "status", "") or "")
+        incomplete = getattr(response, "incomplete_details", None)
+        error = getattr(response, "error", None)
+        reason = str(getattr(incomplete, "reason", "") or "")
+        error_message = str(getattr(error, "message", "") or "")
+        if status == "incomplete" or reason:
+            self._log_ai_event("ai_response_incomplete", status=status, reason=reason, output_len=len(output_text))
+            raise RuntimeError(f"OpenAI response was incomplete: {reason or status}")
+        if error_message:
+            self._log_ai_event("ai_response_error", status=status, error=error_message[:240])
+            raise RuntimeError(f"OpenAI response error: {error_message}")
+        if not output_text:
+            self._log_ai_event("ai_response_empty", status=status, output_items=len(getattr(response, "output", []) or []))
+            raise RuntimeError("OpenAI returned an empty response.")
+
+    def _parse_json_object(self, output_text: str) -> dict:
+        raw_text = str(output_text or "").strip()
+        if raw_text.startswith("```"):
+            raw_text = raw_text.strip("`").strip()
+            if raw_text.lower().startswith("json"):
+                raw_text = raw_text[4:].strip()
+        if not raw_text:
+            return {}
+        decoder = json.JSONDecoder()
+        try:
+            data, _ = decoder.raw_decode(raw_text)
+        except json.JSONDecodeError:
+            if "{" not in raw_text:
+                return {}
+            try:
+                data, _ = decoder.raw_decode(raw_text[raw_text.find("{") :])
+            except json.JSONDecodeError:
+                return {}
+        return data if isinstance(data, dict) else {}
 
     def _trim_input(self, text: str) -> str:
         value = str(text or "")
@@ -441,33 +375,6 @@ class AIService:
         if not source_text.strip():
             raise ValueError("Text is required.")
         return source_text
-
-    def _parse_json_object(self, output_text: str) -> dict:
-        raw_text = str(output_text or "").strip()
-        if raw_text.startswith("```"):
-            raw_text = raw_text.strip("`").strip()
-            if raw_text.lower().startswith("json"):
-                raw_text = raw_text[4:].strip()
-        if not raw_text:
-            return {}
-        decoder = json.JSONDecoder()
-        try:
-            data, _ = decoder.raw_decode(raw_text)
-        except json.JSONDecodeError:
-            if "{" not in raw_text:
-                return {}
-            try:
-                data, _ = decoder.raw_decode(raw_text[raw_text.find("{") :])
-            except json.JSONDecodeError:
-                return {}
-        return data if isinstance(data, dict) else {}
-
-    def _clamp_score(self, value) -> int:
-        try:
-            score = int(round(float(value)))
-        except Exception:
-            return 70
-        return max(0, min(100, score))
 
     def _env_int(self, name: str, default: int) -> int:
         try:

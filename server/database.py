@@ -1,14 +1,14 @@
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
 from sqlalchemy import create_engine
+from dotenv import load_dotenv
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-DATABASE_URL = os.getenv("DATABASE_URL") or "sqlite:///./app.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
 
 
 def mask_database_url(url: str) -> str:
@@ -30,7 +30,7 @@ engine_kwargs = {}
 if DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 
-engine = create_engine(DATABASE_URL, **engine_kwargs)
+engine = create_engine(DATABASE_URL, **engine_kwargs) #이건 db 객체가 아닌 db 연결용 api
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+Base = declarative_base()  # 모든 table 클래스의 부모

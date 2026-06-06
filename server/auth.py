@@ -4,12 +4,8 @@ import hashlib
 import hmac
 import secrets
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-from dotenv import load_dotenv
 from jose import jwt, JWTError
-
-load_dotenv(Path(__file__).resolve().parent / ".env")
 
 SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
 ALGORITHM = "HS256"
@@ -19,7 +15,7 @@ PBKDF2_ITERATIONS = 260_000
 PBKDF2_PREFIX = "pbkdf2_sha256"
 
 if not SECRET_KEY:
-    raise ValueError("SECRET_KEY environment variable is not set.")
+    raise ValueError("SECRET_KEY 환경변수가 설정되지 않았습니다.")
 
 
 def hash_password(password: str) -> str:

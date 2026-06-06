@@ -7,7 +7,6 @@ DEFAULT_SETTINGS = {
     "default_dark_mode": False,
     "input_mode": "clipboard",
     "replace_mode": False,
-    "spell_scope": "current_sentence",
     "history_enabled": False,
 }
 

@@ -24,9 +24,7 @@ class AICache:
             return dict(value)
 
     def set(self, key: str, value: dict):
-        if self.max_entries <= 0:
-            return
-        if not isinstance(value, dict):
+        if self.max_entries <= 0 or not isinstance(value, dict):
             return
         with self._lock:
             self._load()

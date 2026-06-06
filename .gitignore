@@ -1,6 +1,10 @@
-.env
-*.env
-server/.env
 .logs/
-*.log
-node_modules/
+__pycache__/
+*.pyc
+
+server/.env
+server/app.db
+user_settings.json
+
+.agents/
+.codex/

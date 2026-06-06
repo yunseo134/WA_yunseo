@@ -2,14 +2,16 @@
 from pathlib import Path
 
 from client.input.ai_grammary_text_reader import (
+    BROWSER_PROCESS_NAMES,
     UniversalActiveTextReader,
     WORD_PROCESS_NAMES,
     get_foreground_hwnd,
     get_process_name,
-    get_window_title,
 )
 from client.input.browser_extension_bridge import get_browser_extension_bridge
+from client.input.input_mode_state import is_input_mode_active
 from client.input.keyboard_monitor import monitor_typed_text
+from client.input.realtime_reading_pause import is_realtime_reading_paused
 
 try:
     import win32api
@@ -41,34 +43,42 @@ def monitor_realtime_text(callback, poll_interval=0.25, debug=False):
         monitor_typed_text(lambda text: callback(_typed_text_event(text)))
         return
 
-    input_activity = _KeyboardActivityTracker()
+    input_pause = _ForegroundInputPause()
 
     while True:
         try:
-            input_activity.observe()
-            browser_event = browser_bridge.poll_event()
-            if browser_event is not None:
-                callback(input_activity.annotate_event(browser_event))
+            if not is_input_mode_active("realtime") or is_realtime_reading_paused():
                 time.sleep(poll_interval)
                 continue
 
-            if input_activity.should_skip_poll():
+            browser_event = browser_bridge.poll_event()
+            if browser_event is not None:
+                callback(browser_event)
+                time.sleep(poll_interval)
+                continue
+
+            if _is_foreground_browser():
+                browser_event = browser_bridge.recent_event(max_age_seconds=2.0)
+                if browser_event is not None:
+                    callback(browser_event)
+                    time.sleep(poll_interval)
+                    continue
+
+            if input_pause.should_skip_poll():
                 time.sleep(poll_interval)
                 continue
 
             snapshot = reader.poll_snapshot()
             if snapshot is not None:
                 callback(
-                    input_activity.annotate_event(
-                        {
-                            "source": snapshot.source,
-                            "window_title": snapshot.window_title,
-                            "text": snapshot.text,
-                            "reader": snapshot.reader_name,
-                            "window_handle": snapshot.window_handle,
-                            "style_info": snapshot.style_info,
-                        }
-                    )
+                    {
+                        "source": snapshot.source,
+                        "window_title": snapshot.window_title,
+                        "text": snapshot.text,
+                        "reader": snapshot.reader_name,
+                        "window_handle": snapshot.window_handle,
+                        "style_info": snapshot.style_info,
+                    }
                 )
         except Exception as exc:
             _log_error("reader_poll", exc)
@@ -76,51 +86,21 @@ def monitor_realtime_text(callback, poll_interval=0.25, debug=False):
         time.sleep(poll_interval)
 
 
-class _KeyboardActivityTracker:
-    RECENT_INPUT_SECONDS = 3.0
+class _ForegroundInputPause:
     SKIP_AFTER_KEY_SECONDS = 0.55
     KEY_RANGE = range(0x08, 0xFF)
 
     def __init__(self):
         self.last_key_activity = 0.0
-        self.last_key_hwnd = None
-        self.last_key_window_title = ""
 
     def should_skip_poll(self) -> bool:
+        if not self._is_foreground_word():
+            return False
         now = time.monotonic()
-        return self._is_foreground_word() and now - self.last_key_activity < self.SKIP_AFTER_KEY_SECONDS
-
-    def observe(self):
-        if not self._has_keyboard_activity():
-            return
-        self.last_key_activity = time.monotonic()
-        self.last_key_hwnd = self._foreground_hwnd()
-        self.last_key_window_title = self._window_title(self.last_key_hwnd)
-
-    def annotate_event(self, event):
-        enriched = dict(event)
-        event_hwnd = enriched.get("window_handle")
-        if event_hwnd is None:
-            event_hwnd = self._foreground_hwnd()
-        enriched["keyboard_recent"] = self.is_recent_for(
-            event_hwnd,
-            str(enriched.get("window_title") or ""),
-        )
-        return enriched
-
-    def is_recent_for(self, hwnd, window_title="") -> bool:
-        if not self.last_key_activity:
-            return False
-        if time.monotonic() - self.last_key_activity > self.RECENT_INPUT_SECONDS:
-            return False
-        if hwnd and self.last_key_hwnd and int(hwnd) == int(self.last_key_hwnd):
+        if self._has_keyboard_activity():
+            self.last_key_activity = now
             return True
-        if not hwnd:
-            current_hwnd = self._foreground_hwnd()
-            if current_hwnd and self.last_key_hwnd and int(current_hwnd) == int(self.last_key_hwnd):
-                return True
-        normalized_title = str(window_title or "").strip()
-        return bool(normalized_title and normalized_title == self.last_key_window_title)
+        return now - self.last_key_activity < self.SKIP_AFTER_KEY_SECONDS
 
     def _is_foreground_word(self) -> bool:
         try:
@@ -128,20 +108,6 @@ class _KeyboardActivityTracker:
             return get_process_name(hwnd) in WORD_PROCESS_NAMES
         except Exception:
             return False
-
-    def _foreground_hwnd(self):
-        try:
-            return get_foreground_hwnd()
-        except Exception:
-            return None
-
-    def _window_title(self, hwnd):
-        if not hwnd:
-            return ""
-        try:
-            return get_window_title(hwnd)
-        except Exception:
-            return ""
 
     def _has_keyboard_activity(self) -> bool:
         if win32api is None:
@@ -162,8 +128,14 @@ def _typed_text_event(text):
         "window_title": "",
         "text": text,
         "reader": "keyboard",
-        "keyboard_recent": True,
     }
+
+
+def _is_foreground_browser() -> bool:
+    try:
+        return get_process_name(get_foreground_hwnd()) in BROWSER_PROCESS_NAMES
+    except Exception:
+        return False
 
 
 def _log_error(stage, exc):

@@ -1,32 +1,23 @@
-import json
-import time
 from datetime import datetime, timezone
-from pathlib import Path
 from sqlalchemy import inspect, text
 
-from fastapi import FastAPI, Depends, HTTPException, Header, Request
+from fastapi import FastAPI, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
 
 from database import SessionLocal, engine, Base
-from models import User, UsageLog, UserSetting
+from models import User, UsageLog, UserSetting, ToneFavorite
 from schemas import (
     SignupRequest,
     LoginRequest,
     CorrectResponse,
     TokenResponse,
     CorrectRequest,
-    SummaryRequest,
-    SummaryResponse,
-    EvaluationRequest,
-    EvaluationResponse,
-    TitleRequest,
-    TitleResponse,
-    ToneRequest,
-    ToneResponse,
     UsageLogCreateRequest,
     UsageLogResponse,
     UserSettingsRequest,
     UserSettingsResponse,
+    ToneFavoriteCreateRequest,
+    ToneFavoriteResponse,
     AccountVerifyRequest,
     AccountUpdateRequest,
     AccountResponse,
@@ -43,6 +34,8 @@ def ensure_usage_log_columns():
     statements = []
     if "feature_type" not in column_names:
         statements.append("ALTER TABLE usage_logs ADD COLUMN feature_type INTEGER NOT NULL DEFAULT 2")
+    if "feature_label" not in column_names:
+        statements.append("ALTER TABLE usage_logs ADD COLUMN feature_label VARCHAR(50)")
     if "title" not in column_names:
         statements.append("ALTER TABLE usage_logs ADD COLUMN title VARCHAR(255)")
     if "score" not in column_names:
@@ -51,6 +44,8 @@ def ensure_usage_log_columns():
         statements.append("ALTER TABLE usage_logs ADD COLUMN tone VARCHAR(100)")
     if "spelling_feedback" not in column_names:
         statements.append("ALTER TABLE usage_logs ADD COLUMN spelling_feedback TEXT")
+    if "evaluation_reason" not in column_names:
+        statements.append("ALTER TABLE usage_logs ADD COLUMN evaluation_reason TEXT")
 
     if not statements:
         return
@@ -80,64 +75,18 @@ def ensure_user_columns():
 
 ensure_user_columns()
 
-
-def ensure_user_setting_columns():
-    inspector = inspect(engine)
-    column_names = {column["name"] for column in inspector.get_columns("user_settings")}
-    statements = []
-    if "spell_scope" not in column_names:
-        statements.append("ALTER TABLE user_settings ADD COLUMN spell_scope VARCHAR(30) NOT NULL DEFAULT 'current_sentence'")
-
-    if not statements:
-        return
-
-    with engine.begin() as connection:
-        for statement in statements:
-            connection.execute(text(statement))
-
-
-ensure_user_setting_columns()
-
-SERVER_BUILD_ID = "2026-05-29-spell-scope"
-
-app = FastAPI(title="Writing Assistant API")
+app = FastAPI(title="AI 문서 보조 서버") # 서버본체
 ai_service = AIService()
 
-_LOG_DIR = Path(__file__).resolve().parents[1] / ".logs"
-_SERVER_REQUEST_LOG = _LOG_DIR / "server_requests.jsonl"
+FEATURE_LABELS = {
+    1: "\ud14d\uc2a4\ud2b8 \uae30\ub85d",
+    2: "\uad50\uc815 \uae30\ub85d",
+    3: "\uc694\uc57d \uae30\ub85d",
+    4: "\ubb38\uccb4 \ubcc0\uacbd \uae30\ub85d",
+}
 
-
-def write_server_event(event: str, **fields):
-    payload = {
-        "ts": datetime.now().isoformat(timespec="milliseconds"),
-        "event": event,
-        **fields,
-    }
-    try:
-        _LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with _SERVER_REQUEST_LOG.open("a", encoding="utf-8") as log_file:
-            log_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
-
-@app.middleware("http")
-async def request_diagnostics(request: Request, call_next):
-    started_at = time.monotonic()
-    status_code = 500
-    try:
-        response = await call_next(request)
-        status_code = response.status_code
-        return response
-    finally:
-        write_server_event(
-            "http_request",
-            method=request.method,
-            path=request.url.path,
-            status_code=status_code,
-            duration_ms=int((time.monotonic() - started_at) * 1000),
-            client=request.client.host if request.client else "",
-        )
+def feature_label_for(feature_type):
+    return FEATURE_LABELS.get(int(feature_type or 0), "\uae30\ub85d")
 
 
 def get_db():
@@ -180,7 +129,7 @@ def get_current_user(
 
 @app.get("/")
 def root():
-    return {"message": "server is running", "build_id": SERVER_BUILD_ID}
+    return {"message": "server is running 2021810064"}
 
 
 @app.post("/signup")
@@ -274,6 +223,7 @@ def delete_account(
 ):
     db.query(UsageLog).filter(UsageLog.user_id == current_user.id).delete()
     db.query(UserSetting).filter(UserSetting.user_id == current_user.id).delete()
+    db.query(ToneFavorite).filter(ToneFavorite.user_id == current_user.id).delete()
     db.delete(current_user)
     db.commit()
     return {"message": "계정이 삭제되었습니다."}
@@ -296,6 +246,7 @@ def correct_text(
         input_text=data.text,
         output_text=corrected,
         feature_type=2,
+        feature_label=feature_label_for(2),
         spelling_feedback=result.get("feedback"),
     )
     db.add(log)
@@ -321,52 +272,13 @@ def correct_text_public(data: CorrectRequest):
     )
 
 
-@app.post("/summary-public", response_model=SummaryResponse)
-def summarize_text_public(data: SummaryRequest):
-    result = run_ai_feature("summary", lambda: ai_service.summarize_text(data.text))
-    return SummaryResponse(summary=result["summary"])
-
-
-@app.post("/evaluation-public", response_model=EvaluationResponse)
-def evaluate_text_public(data: EvaluationRequest):
-    result = run_ai_feature("evaluation", lambda: ai_service.evaluate_text(data.text))
-    return EvaluationResponse(
-        score=int(result["score"]),
-        feedback=str(result.get("feedback") or ""),
-    )
-
-
-@app.post("/title-public", response_model=TitleResponse)
-def recommend_title_public(data: TitleRequest):
-    result = run_ai_feature("title", lambda: ai_service.recommend_title(data.text))
-    return TitleResponse(title=result["title"])
-
-
-@app.post("/tone-public", response_model=ToneResponse)
-def convert_tone_public(data: ToneRequest):
-    result = run_ai_feature("tone", lambda: ai_service.convert_tone(data.text, data.tone))
-    return ToneResponse(
-        converted_text=result["converted_text"],
-        feedback=result.get("feedback"),
-    )
-
-
-def run_text_correction(text_value: str) -> dict[str, str]:
+def run_text_correction(text_value: str) -> dict[str, object]:
     try:
         return ai_service.correct_text(text_value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"OpenAI correction failed: {exc}") from exc
-
-
-def run_ai_feature(feature_name: str, callback):
-    try:
-        return callback()
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"OpenAI {feature_name} failed: {exc}") from exc
 
 
 @app.post("/logs", response_model=UsageLogResponse)
@@ -382,6 +294,8 @@ def create_usage_log(
     if data.score is not None and not 0 <= int(data.score) <= 100:
         raise HTTPException(status_code=400, detail="score must be between 0 and 100.")
 
+    feature_label = data.feature_label or feature_label_for(data.feature_type)
+
     if data.feature_type == 1:
         existing_log = (
             db.query(UsageLog)
@@ -394,10 +308,13 @@ def create_usage_log(
             .first()
         )
         if existing_log:
+            existing_log.feature_label = feature_label
             if data.title is not None:
                 existing_log.title = data.title
             if data.score is not None:
                 existing_log.score = data.score
+            if data.evaluation_reason is not None:
+                existing_log.evaluation_reason = data.evaluation_reason
             existing_log.output_text = data.output_text or existing_log.output_text or ""
             db.commit()
             db.refresh(existing_log)
@@ -408,10 +325,12 @@ def create_usage_log(
         input_text=data.input_text,
         output_text=data.output_text or "",
         feature_type=data.feature_type,
+        feature_label=feature_label,
         title=data.title,
         score=data.score,
         tone=data.tone,
         spelling_feedback=data.spelling_feedback,
+        evaluation_reason=data.evaluation_reason,
     )
     db.add(log)
     db.commit()
@@ -431,6 +350,73 @@ def list_usage_logs(
     return query.order_by(UsageLog.created_at.desc()).all()
 
 
+@app.get("/tone-favorites", response_model=list[ToneFavoriteResponse])
+def list_tone_favorites(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return (
+        db.query(ToneFavorite)
+        .filter(ToneFavorite.user_id == current_user.id)
+        .order_by(ToneFavorite.created_at.desc(), ToneFavorite.id.desc())
+        .limit(10)
+        .all()
+    )
+
+
+@app.post("/tone-favorites", response_model=ToneFavoriteResponse)
+def create_tone_favorite(
+    data: ToneFavoriteCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    tone = str(data.tone or "").strip()
+    if not tone:
+        raise HTTPException(status_code=400, detail="tone is required.")
+    tone = tone[:100]
+    existing = (
+        db.query(ToneFavorite)
+        .filter(ToneFavorite.user_id == current_user.id, ToneFavorite.tone == tone)
+        .first()
+    )
+    if existing:
+        return existing
+    count = db.query(ToneFavorite).filter(ToneFavorite.user_id == current_user.id).count()
+    if count >= 10:
+        oldest = (
+            db.query(ToneFavorite)
+            .filter(ToneFavorite.user_id == current_user.id)
+            .order_by(ToneFavorite.created_at.asc(), ToneFavorite.id.asc())
+            .first()
+        )
+        if oldest:
+            db.delete(oldest)
+            db.flush()
+    favorite = ToneFavorite(user_id=current_user.id, tone=tone)
+    db.add(favorite)
+    db.commit()
+    db.refresh(favorite)
+    return favorite
+
+
+@app.delete("/tone-favorites/{favorite_id}")
+def delete_tone_favorite(
+    favorite_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    favorite = (
+        db.query(ToneFavorite)
+        .filter(ToneFavorite.id == favorite_id, ToneFavorite.user_id == current_user.id)
+        .first()
+    )
+    if not favorite:
+        raise HTTPException(status_code=404, detail="favorite not found.")
+    db.delete(favorite)
+    db.commit()
+    return {"deleted": True}
+
+
 @app.get("/settings", response_model=UserSettingsResponse)
 def get_user_settings(
     current_user: User = Depends(get_current_user),
@@ -445,7 +431,6 @@ def get_user_settings(
         history_enabled=settings.history_enabled,
         input_mode=settings.input_mode,
         replace_mode=settings.replace_mode,
-        spell_scope=settings.spell_scope,
         updated_at=settings.updated_at,
     )
 
@@ -456,9 +441,8 @@ def update_user_settings(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    input_mode = "clipboard" if data.input_mode == "clipboard" else "realtime"
-    replace_mode = bool(data.replace_mode) and input_mode == "realtime"
-    spell_scope = data.spell_scope if data.spell_scope in {"current_sentence", "current_paragraph", "full_text"} else "current_sentence"
+    input_mode = data.input_mode if data.input_mode in {"clipboard", "drag", "realtime"} else "clipboard"
+    replace_mode = bool(data.replace_mode)
     settings = db.query(UserSetting).filter(UserSetting.user_id == current_user.id).first()
     if not settings:
         settings = UserSetting(user_id=current_user.id)
@@ -468,8 +452,7 @@ def update_user_settings(
     settings.history_enabled = bool(data.history_enabled)
     settings.input_mode = input_mode
     settings.replace_mode = replace_mode
-    settings.spell_scope = spell_scope
-    settings.updated_at = datetime.utcnow()
+    settings.updated_at = datetime.now()
     db.commit()
     db.refresh(settings)
     return UserSettingsResponse(
@@ -478,6 +461,5 @@ def update_user_settings(
         history_enabled=settings.history_enabled,
         input_mode=settings.input_mode,
         replace_mode=settings.replace_mode,
-        spell_scope=settings.spell_scope,
         updated_at=settings.updated_at,
     )

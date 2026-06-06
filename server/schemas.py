@@ -62,60 +62,29 @@ class CorrectResponse(BaseModel):
     corrections: list[CorrectionIssue] = Field(default_factory=list)
 
 
-class SummaryRequest(BaseModel):
-    text: str
-
-
-class SummaryResponse(BaseModel):
-    summary: str
-
-
-class EvaluationRequest(BaseModel):
-    text: str
-
-
-class EvaluationResponse(BaseModel):
-    score: int
-    feedback: str
-
-
-class TitleRequest(BaseModel):
-    text: str
-
-
-class TitleResponse(BaseModel):
-    title: str
-
-
-class ToneRequest(BaseModel):
-    text: str
-    tone: str = ""
-
-
-class ToneResponse(BaseModel):
-    converted_text: str
-    feedback: str | None = None
-
-
 class UsageLogCreateRequest(BaseModel):
     feature_type: int
+    feature_label: str | None = None
     input_text: str
     output_text: str = ""
     title: str | None = None
     score: int | None = None
     tone: str | None = None
     spelling_feedback: str | None = None
+    evaluation_reason: str | None = None
 
 
 class UsageLogResponse(BaseModel):
     id: int
     feature_type: int
+    feature_label: str | None = None
     input_text: str
     output_text: str
     title: str | None = None
     score: int | None = None
     tone: str | None = None
     spelling_feedback: str | None = None
+    evaluation_reason: str | None = None
     created_at: datetime
 
     class Config:
@@ -127,12 +96,24 @@ class UserSettingsRequest(BaseModel):
     history_enabled: bool = False
     input_mode: str = "clipboard"
     replace_mode: bool = False
-    spell_scope: str = "current_sentence"
 
 
 class UserSettingsResponse(UserSettingsRequest):
     has_settings: bool = True
     updated_at: datetime | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class ToneFavoriteCreateRequest(BaseModel):
+    tone: str
+
+
+class ToneFavoriteResponse(BaseModel):
+    id: int
+    tone: str
+    created_at: datetime
 
     class Config:
         from_attributes = True

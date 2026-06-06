@@ -16,34 +16,6 @@ class AIClient:
             "corrections": data.get("corrections") or [],
         }
 
-    def summarize(self, text):
-        data = self._post("/summary-public", {"text": text})
-        if not data.get("summary"):
-            raise RuntimeError("요약 응답이 비어 있습니다.")
-        return data["summary"]
-
-    def evaluate(self, text):
-        data = self._post("/evaluation-public", {"text": text})
-        return {
-            "score": int(data.get("score") or 0),
-            "feedback": data.get("feedback") or "",
-        }
-
-    def recommend_title(self, text):
-        data = self._post("/title-public", {"text": text})
-        if not data.get("title"):
-            raise RuntimeError("제목 추천 응답이 비어 있습니다.")
-        return data["title"]
-
-    def convert_tone(self, text, tone):
-        data = self._post("/tone-public", {"text": text, "tone": tone or ""})
-        if not data.get("converted_text"):
-            raise RuntimeError("문체 변환 응답이 비어 있습니다.")
-        return {
-            "converted_text": data["converted_text"],
-            "feedback": data.get("feedback") or "",
-        }
-
     def request(self, prompt):
         return self.correct_spelling(prompt)
 
