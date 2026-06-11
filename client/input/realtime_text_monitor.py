@@ -2,6 +2,7 @@
 from pathlib import Path
 
 from client.input.ai_grammary_text_reader import (
+    BROWSER_PROCESS_NAMES,
     UniversalActiveTextReader,
     WORD_PROCESS_NAMES,
     get_foreground_hwnd,
@@ -55,6 +56,13 @@ def monitor_realtime_text(callback, poll_interval=0.25, debug=False):
                 callback(browser_event)
                 time.sleep(poll_interval)
                 continue
+
+            if _is_foreground_browser():
+                browser_event = browser_bridge.recent_event(max_age_seconds=2.0)
+                if browser_event is not None:
+                    callback(browser_event)
+                    time.sleep(poll_interval)
+                    continue
 
             if input_pause.should_skip_poll():
                 time.sleep(poll_interval)
@@ -121,6 +129,13 @@ def _typed_text_event(text):
         "text": text,
         "reader": "keyboard",
     }
+
+
+def _is_foreground_browser() -> bool:
+    try:
+        return get_process_name(get_foreground_hwnd()) in BROWSER_PROCESS_NAMES
+    except Exception:
+        return False
 
 
 def _log_error(stage, exc):

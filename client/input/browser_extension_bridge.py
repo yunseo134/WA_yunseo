@@ -27,6 +27,8 @@ class BrowserExtensionBridge:
     _thread: threading.Thread | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _latest_event: dict[str, Any] | None = None
+    _latest_active_event: dict[str, Any] | None = None
+    _latest_active_at: float = 0.0
     _latest_signature: tuple[str, str, str, str, str] | None = None
     _pending_commands: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     _session_text_memory: dict[str, str] = field(default_factory=dict)
@@ -121,11 +123,23 @@ class BrowserExtensionBridge:
             return None
         session_id = str(payload.get("session_id") or "")
         dom_debug = payload.get("dom_debug") or {}
+        extraction_strategy = str(
+            payload.get("extraction_strategy") or dom_debug.get("extractionStrategy") or ""
+        )
         if dom_debug.get("hasRange") and self._session_text_memory.get(session_id):
             return None
 
         previous_text = self._session_text_memory.get(session_id, "")
         text = self._restore_session_blank_lines(session_id, previous_text, text)
+        if self._is_collapsed_structure_regression(previous_text, text):
+            self._log(
+                "capture_rejected_collapsed "
+                f"session={session_id!r} strategy={extraction_strategy!r} "
+                f"newlines={previous_text.count(chr(10))}->{text.count(chr(10))} "
+                f"blank_lines={self._blank_line_count(previous_text)}->{self._blank_line_count(text)} "
+                f"text_len={len(text)}"
+            )
+            return None
         event = {
             "source": "realtime",
             "reader": "browser_extension",
@@ -140,6 +154,7 @@ class BrowserExtensionBridge:
                 "segments": payload.get("segments") or [],
                 "html": str(payload.get("html") or ""),
                 "target_kind": str(payload.get("target_kind") or ""),
+                "extraction_strategy": extraction_strategy,
                 "dom_debug": dom_debug,
             },
         }
@@ -156,12 +171,16 @@ class BrowserExtensionBridge:
                 return None
             self._latest_signature = signature
             self._latest_event = event
+            self._latest_active_event = event
+            self._latest_active_at = time.time()
             self._session_text_memory[session_id] = text
             self._capture_count += 1
         self._log(
             "capture "
             f"session={session_id!r} kind={event['style_info'].get('target_kind')!r} "
+            f"strategy={extraction_strategy!r} "
             f"text_len={len(text)} newlines={text.count(chr(10))} "
+            f"blank_lines={self._blank_line_count(text)} "
             f"segments={len(event['style_info'].get('segments') or [])} "
             f"title={event['window_title']!r} "
             f"sample={self._segment_sample(event['style_info'].get('segments') or [])!r} "
@@ -198,10 +217,32 @@ class BrowserExtensionBridge:
     def _split_lines(self, text: str) -> list[str]:
         return str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
+    def _is_collapsed_structure_regression(self, previous_text: str, current_text: str) -> bool:
+        if not previous_text or not current_text:
+            return False
+        previous_newlines = previous_text.count("\n")
+        current_newlines = current_text.count("\n")
+        if previous_newlines < 2 or current_newlines >= previous_newlines:
+            return False
+        if previous_newlines - current_newlines < 2:
+            return False
+        return self._compact_text(previous_text) == self._compact_text(current_text)
+
+    def _compact_text(self, text: str) -> str:
+        return "".join(str(text or "").split())
+
     def poll_event(self) -> dict[str, Any] | None:
         with self._lock:
             event = self._latest_event
             self._latest_event = None
+        return event
+
+    def recent_event(self, max_age_seconds: float = 2.0) -> dict[str, Any] | None:
+        with self._lock:
+            event = self._latest_active_event
+            age = time.time() - self._latest_active_at
+        if event is None or age > max_age_seconds:
+            return None
         return event
 
     def queue_apply(self, session_id: str, text: str, style_info: dict[str, Any] | None = None):
@@ -264,6 +305,10 @@ class BrowserExtensionBridge:
                 "command_polls": self._command_poll_count,
                 "pending_sessions": len(self._pending_commands),
                 "has_latest_event": self._latest_event is not None,
+                "has_recent_event": self._latest_active_event is not None,
+                "recent_event_age": round(max(0.0, time.time() - self._latest_active_at), 3)
+                if self._latest_active_event is not None
+                else None,
             }
 
     def _log(self, message: str):
@@ -311,6 +356,8 @@ class BrowserExtensionBridge:
                 }
             )
         return {
+            "extractionStrategy": dom_debug.get("extractionStrategy"),
+            "extractionCandidates": dom_debug.get("extractionCandidates"),
             "childElementCount": dom_debug.get("childElementCount"),
             "hasRange": dom_debug.get("hasRange"),
             "textPreview": str(dom_debug.get("textPreview") or "")[:160],

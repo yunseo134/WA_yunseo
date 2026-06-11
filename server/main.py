@@ -12,6 +12,8 @@ from schemas import (
     CorrectResponse,
     TokenResponse,
     CorrectRequest,
+    BetaFeatureRequest,
+    BetaFeatureResponse,
     UsageLogCreateRequest,
     UsageLogResponse,
     UserSettingsRequest,
@@ -238,7 +240,8 @@ def correct_text(
     if not data.text.strip():
         raise HTTPException(status_code=400, detail="교정할 텍스트가 비어 있습니다.")
 
-    corrected = ai_service.correct_text(data.text)
+    result = run_text_correction(data.text)
+    corrected = result["corrected_text"]
 
     log = UsageLog(
         user_id=current_user.id,
@@ -246,11 +249,48 @@ def correct_text(
         output_text=corrected,
         feature_type=2,
         feature_label=feature_label_for(2),
+        spelling_feedback=result.get("feedback"),
     )
     db.add(log)
     db.commit()
 
-    return CorrectResponse(corrected_text=corrected)
+    return CorrectResponse(
+        corrected_text=corrected,
+        spelling_feedback=result.get("feedback"),
+        corrections=result.get("corrections") or [],
+    )
+
+
+@app.post("/correct-public", response_model=CorrectResponse)
+def correct_text_public(data: CorrectRequest):
+    if not data.text.strip():
+        raise HTTPException(status_code=400, detail="Text is required.")
+
+    result = run_text_correction(data.text)
+    return CorrectResponse(
+        corrected_text=result["corrected_text"],
+        spelling_feedback=result.get("feedback"),
+        corrections=result.get("corrections") or [],
+    )
+
+
+def run_text_correction(text_value: str) -> dict[str, object]:
+    try:
+        return ai_service.correct_text(text_value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"OpenAI correction failed: {exc}") from exc
+
+
+@app.post("/beta-public", response_model=BetaFeatureResponse)
+def run_beta_feature_public(data: BetaFeatureRequest):
+    try:
+        return ai_service.beta_showcase(data.text, data.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"OpenAI beta feature failed: {exc}") from exc
 
 
 @app.post("/logs", response_model=UsageLogResponse)

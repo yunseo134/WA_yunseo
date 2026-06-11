@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime
 # fastapi pydantic에서 json 요청을 자동으로 파싱
 # api 입출력 형식 정의
@@ -42,8 +42,35 @@ class CorrectRequest(BaseModel):
     text: str
 
 
+class BetaFeatureRequest(BaseModel):
+    text: str
+    mode: str = "correction_cards"
+
+
+class BetaFeatureResponse(BaseModel):
+    title: str = ""
+    result_text: str = ""
+    cards: list[dict[str, str]] = Field(default_factory=list)
+
+
+class CorrectionIssue(BaseModel):
+    id: str = ""
+    original: str = ""
+    suggestion: str = ""
+    category: str = ""
+    explanation: str = ""
+    confidence: str = ""
+    severity: str = ""
+    source_start: int | None = None
+    source_end: int | None = None
+    anchor_text: str = ""
+    display_title: str = ""
+
+
 class CorrectResponse(BaseModel):
     corrected_text: str
+    spelling_feedback: str | None = None
+    corrections: list[CorrectionIssue] = Field(default_factory=list)
 
 
 class UsageLogCreateRequest(BaseModel):

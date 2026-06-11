@@ -1,14 +1,44 @@
 (() => {
-  const BRIDGE = "http://127.0.0.1:8766";
   const SESSION_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const POLL_MS = 500;
   const CAPTURE_DEBOUNCE_MS = 600;
+  const MAX_CAPTURE_TEXT_LENGTH = 50000;
+  const EDITABLE_SELECTOR = [
+    "textarea",
+    "input",
+    "[contenteditable='']",
+    "[contenteditable='true']",
+    "[contenteditable='plaintext-only']"
+  ].join(",");
+  const EDITOR_ROOT_SELECTOR = [
+    "[role='textbox']",
+    ".ProseMirror",
+    ".ql-editor",
+    ".toastui-editor-contents",
+    ".cm-content",
+    ".se-main-container",
+    ".se-component-content",
+    ".se-module-text",
+    ".se-text-paragraph"
+  ].join(",");
+  const BROAD_EDITOR_ROOT_SELECTOR = [
+    ".se-main-container",
+    ".ProseMirror",
+    ".ql-editor",
+    ".toastui-editor-contents",
+    ".cm-content",
+    "[role='textbox']"
+  ].join(",");
+  const EDITOR_QUERY_SELECTOR = `${EDITABLE_SELECTOR},${EDITOR_ROOT_SELECTOR}`;
+  const TEXT_INPUT_TYPES = new Set(["", "text", "search", "url", "tel", "email", "number"]);
+  const SMALL_BUFFER_TEXT_LENGTH = 12;
 
   let captureTimer = null;
   let settleTimers = [];
   let lastSignature = "";
   let lastCaptureSentAt = 0;
   let lastEditable = null;
+  let lastCaptureState = { ready: false, reason: "loaded", sessionId: SESSION_ID };
   let observedEditable = null;
   let editableObserver = null;
 
@@ -17,10 +47,60 @@
     url: location.href
   });
 
+  function bridgeRequest(type, payload = {}) {
+    return new Promise((resolve, reject) => {
+      if (typeof chrome === "undefined" || !chrome.runtime?.sendMessage) {
+        reject(new Error("Extension runtime is unavailable."));
+        return;
+      }
+      chrome.runtime.sendMessage({ type, ...payload }, (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message));
+          return;
+        }
+        if (!response || response.ok === false) {
+          reject(new Error(response?.error || "Local bridge request failed."));
+          return;
+        }
+        resolve(response);
+      });
+    });
+  }
+
   function isEditableElement(node) {
     if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
     const tag = node.tagName.toLowerCase();
-    return tag === "textarea" || node.isContentEditable;
+    return tag === "textarea" || isSupportedTextInput(node) || node.isContentEditable || isEditorRootElement(node);
+  }
+
+  function isEditorRootElement(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE || !node.matches) return false;
+    if (!node.matches(EDITOR_ROOT_SELECTOR)) return false;
+    if (isPlainTextControl(node) || isEditorChromeNode(node)) return false;
+    return Boolean(String(node.textContent || "").trim() || node.querySelector(EDITABLE_SELECTOR));
+  }
+
+  function isSupportedTextInput(element) {
+    if (!element || element.tagName?.toLowerCase() !== "input") return false;
+    const type = String(element.getAttribute("type") || element.type || "text").toLowerCase();
+    return TEXT_INPUT_TYPES.has(type) && !isSensitiveEditable(element);
+  }
+
+  function isPlainTextControl(element) {
+    return Boolean(element && element.matches && (element.matches("textarea") || isSupportedTextInput(element)));
+  }
+
+  function isSensitiveEditable(element) {
+    if (!element || !element.matches) return true;
+    const type = String(element.getAttribute("type") || element.type || "").toLowerCase();
+    if (["password", "hidden", "file", "checkbox", "radio", "submit", "button", "reset", "image", "color", "range", "date", "datetime-local", "month", "time", "week"].includes(type)) {
+      return true;
+    }
+    const autocomplete = String(element.getAttribute("autocomplete") || "").toLowerCase();
+    if (/password|cc-|credit-card|one-time-code|otp/.test(autocomplete)) return true;
+    const label = `${element.id || ""} ${element.name || ""} ${element.getAttribute("aria-label") || ""} ${element.getAttribute("placeholder") || ""}`.toLowerCase();
+    return /password|passwd|secret|token|otp|인증|비밀번호|암호|카드|보안/.test(label);
   }
 
   function closestEditableFromNode(node) {
@@ -28,7 +108,7 @@
     const element = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
     if (!element || !element.closest) return null;
     if (isEditorChromeNode(element)) return null;
-    return element.closest("textarea,[contenteditable=''],[contenteditable='true']");
+    return element.closest(EDITOR_QUERY_SELECTOR);
   }
 
   function activeEditable() {
@@ -36,35 +116,49 @@
     if (selection && selection.rangeCount > 0) {
       const editableFromSelection = closestEditableFromNode(selection.anchorNode);
       if (isCaptureReadyEditable(editableFromSelection)) {
-        lastEditable = editableFromSelection;
-        observeEditable(editableFromSelection);
-        return editableFromSelection;
+        const preferred = preferredEditableForElement(editableFromSelection);
+        lastEditable = preferred;
+        observeEditable(preferred);
+        return preferred;
       }
     }
 
-    const active = document.activeElement;
+    const active = deepActiveElement();
     if (isCaptureReadyEditable(active)) {
-      lastEditable = active;
-      observeEditable(active);
-      return active;
+      const preferred = preferredEditableForActiveControl(active);
+      lastEditable = preferred;
+      observeEditable(preferred);
+      return preferred;
     }
 
     const fallback = bestEditableCandidate();
     if (fallback) {
-      lastEditable = fallback;
-      observeEditable(fallback);
-      return fallback;
+      const preferred = preferredEditableForElement(fallback);
+      lastEditable = preferred;
+      observeEditable(preferred);
+      return preferred;
     }
     return null;
+  }
+
+  function deepActiveElement(root = document) {
+    let active = root.activeElement || document.activeElement;
+    const seen = new Set();
+    while (active && active.shadowRoot && active.shadowRoot.activeElement && !seen.has(active)) {
+      seen.add(active);
+      active = active.shadowRoot.activeElement;
+    }
+    return active;
   }
 
   function fallbackEditable() {
     if (isUsableEditable(lastEditable)) return lastEditable;
     const fallback = bestEditableCandidate();
     if (fallback) {
-      lastEditable = fallback;
-      observeEditable(fallback);
-      return fallback;
+      const preferred = preferredEditableForElement(fallback);
+      lastEditable = preferred;
+      observeEditable(preferred);
+      return preferred;
     }
     return null;
   }
@@ -74,7 +168,7 @@
   }
 
   function bestEditableCandidate() {
-    const candidates = Array.from(document.querySelectorAll("textarea,[contenteditable=''],[contenteditable='true']"))
+    const candidates = queryEditableCandidates(document)
       .filter((element) => isCaptureReadyEditable(element) && editableCandidateText(element).trim());
     if (!candidates.length) return null;
     if (candidates.length === 1) return candidates[0];
@@ -85,6 +179,22 @@
     })[0];
   }
 
+  function queryEditableCandidates(root) {
+    const result = [];
+    const pushAll = (scope) => {
+      if (!scope || !scope.querySelectorAll) return;
+      if (scope.nodeType === Node.ELEMENT_NODE && scope.matches?.(EDITOR_QUERY_SELECTOR)) {
+        result.push(scope);
+      }
+      scope.querySelectorAll(EDITOR_QUERY_SELECTOR).forEach((element) => result.push(element));
+      scope.querySelectorAll("*").forEach((element) => {
+        if (element.shadowRoot) pushAll(element.shadowRoot);
+      });
+    };
+    pushAll(root);
+    return Array.from(new Set(result));
+  }
+
   function isVisibleEditable(element) {
     if (!element) return false;
     const rect = element.getBoundingClientRect();
@@ -93,7 +203,89 @@
   }
 
   function isCaptureReadyEditable(element) {
-    return Boolean(isEditableElement(element) && isVisibleEditable(element) && !isTransientInputBuffer(element));
+    return Boolean(isEditableElement(element) && isVisibleEditable(element) && !isSensitiveEditable(element) && !isTransientInputBuffer(element));
+  }
+
+  function preferredEditableForActiveControl(active) {
+    if (!isPlainTextControl(active)) return preferredEditableForElement(active);
+    const activeText = editableCandidateText(active).trim();
+    if (activeText.length > SMALL_BUFFER_TEXT_LENGTH && !looksLikeInputBuffer(active)) {
+      return active;
+    }
+
+    const richer = bestRichEditableCandidate(active, activeText.length);
+    return richer || active;
+  }
+
+  function preferredEditableForElement(element) {
+    if (!element || isPlainTextControl(element)) return element;
+    const promoted = promotedEditorRoot(element);
+    return promoted || element;
+  }
+
+  function promotedEditorRoot(element) {
+    const currentTextLength = editableCandidateText(element).trim().length;
+    const candidates = [];
+    let cursor = element;
+    while (cursor && cursor.nodeType === Node.ELEMENT_NODE) {
+      if (cursor.matches?.(BROAD_EDITOR_ROOT_SELECTOR) || cursor.matches?.(".se-component-content")) {
+        candidates.push(cursor);
+      }
+      cursor = cursor.parentElement;
+    }
+
+    const usable = candidates
+      .filter((candidate) => candidate !== element)
+      .filter((candidate) => isCaptureReadyEditable(candidate))
+      .map((candidate) => ({
+        element: candidate,
+        textLength: editableCandidateText(candidate).trim().length
+      }))
+      .filter((candidate) => candidate.textLength >= Math.max(currentTextLength, 1));
+
+    if (!usable.length) return null;
+    usable.sort((left, right) => {
+      const leftScore = left.textLength + visibleArea(left.element) / 100 + editorLikeScore(left.element);
+      const rightScore = right.textLength + visibleArea(right.element) / 100 + editorLikeScore(right.element);
+      return rightScore - leftScore;
+    });
+    return usable[0].element;
+  }
+
+  function bestRichEditableCandidate(active, activeTextLength) {
+    const candidates = queryEditableCandidates(document)
+      .filter((element) => element !== active)
+      .filter((element) => !isPlainTextControl(element))
+      .filter((element) => isCaptureReadyEditable(element))
+      .map((element) => ({
+        element,
+        text: editableCandidateText(element).trim()
+      }))
+      .filter((candidate) => candidate.text.length >= Math.max(3, activeTextLength + 1));
+
+    if (!candidates.length) return null;
+    candidates.sort((left, right) => richCandidateScore(right, active) - richCandidateScore(left, active));
+    return candidates[0].element;
+  }
+
+  function richCandidateScore(candidate, active) {
+    const element = candidate.element;
+    let score = candidate.text.length + visibleArea(element) / 100 + editorLikeScore(element);
+    if (element.contains(active) || active.closest?.(EDITOR_ROOT_SELECTOR) === element) score += 2500;
+    if (isNaverSmartEditorElement(element)) score += 1200;
+    return score;
+  }
+
+  function looksLikeInputBuffer(element) {
+    if (!element || !element.matches) return false;
+    if (element.matches("[data-input-buffer]")) return true;
+    const attrs = `${element.id || ""} ${element.className || ""} ${element.getAttribute("aria-label") || ""}`.toLowerCase();
+    return /input-buffer|inputbuffer|composition|hidden|dummy/.test(attrs);
+  }
+
+  function isNaverSmartEditorElement(element) {
+    if (!element || !element.matches) return false;
+    return Boolean(element.matches(".se-main-container,.se-component-content,.se-module-text,.se-text-paragraph"));
   }
 
   function isTransientInputBuffer(element) {
@@ -109,7 +301,7 @@
 
   function editorContentText(element) {
     if (!element) return "";
-    if (element.matches && element.matches("textarea")) return element.value || "";
+    if (element.matches && isPlainTextControl(element)) return element.value || "";
     const chunks = [];
     const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
@@ -127,15 +319,16 @@
   function editorLikeScore(element) {
     const attrs = `${element.id || ""} ${element.className || ""} ${element.getAttribute("role") || ""} ${element.getAttribute("aria-label") || ""}`.toLowerCase();
     let score = 0;
-    if (/editor|write|content|article|post|se-|prosemirror|textbox/.test(attrs)) score += 500;
+    if (/editor|write|content|article|post|se-|smarteditor|prosemirror|textbox/.test(attrs)) score += 500;
     if (element.getAttribute("role") === "textbox") score += 300;
-    if (element.matches("textarea")) score += 200;
+    if (isNaverSmartEditorElement(element)) score += 700;
+    if (isPlainTextControl(element)) score += 200;
     return score;
   }
 
   function editableCandidateText(element) {
     if (!element) return "";
-    if (element.matches("textarea")) return element.value || "";
+    if (isPlainTextControl(element)) return element.value || "";
     return editorContentText(element);
   }
 
@@ -147,12 +340,19 @@
   function captureInput(element) {
     const text = element.value || "";
     return {
-      text,
+      text: clampCaptureText(text),
       html: "",
-      target_kind: element.tagName.toLowerCase(),
+      // The desktop bridge currently accepts "textarea" and "contenteditable".
+      // Plain input controls use the textarea path and keep the real kind in dom_debug.
+      target_kind: "textarea",
       selection: {
         start: element.selectionStart || 0,
         end: element.selectionEnd || 0
+      },
+      dom_debug: {
+        actualTargetKind: element.tagName.toLowerCase(),
+        inputType: element.getAttribute("type") || element.type || "",
+        textPreview: String(text || "").slice(0, 160)
       },
       segments: []
     };
@@ -160,17 +360,27 @@
 
   function captureContentEditable(element) {
     const range = selectedRangeInside(element);
-    const elementText = editablePlainText(element);
-    const text = elementText;
+    const extraction = extractEditableText(element);
+    const text = clampCaptureText(extraction.text);
     const segments = styleSegmentsFromElement(element, text);
+    const debug = domDebug(element, range);
+    debug.extractionStrategy = extraction.strategy;
+    debug.extractionCandidates = extraction.candidates;
     return {
       text,
       html: element.innerHTML,
       target_kind: "contenteditable",
-      dom_debug: domDebug(element, range),
+      dom_debug: debug,
+      extraction_strategy: extraction.strategy,
       selection: {},
       segments
     };
+  }
+
+  function clampCaptureText(text) {
+    const value = String(text || "");
+    if (value.length <= MAX_CAPTURE_TEXT_LENGTH) return value;
+    return value.slice(0, MAX_CAPTURE_TEXT_LENGTH);
   }
 
   function normalizeComparableText(text) {
@@ -178,7 +388,94 @@
   }
 
   function editablePlainText(element) {
-    const blockSelector = "p,div,li,h1,h2,h3,h4,h5,h6,blockquote,pre";
+    return extractEditableText(element).text;
+  }
+
+  function extractEditableText(element) {
+    const candidates = [];
+    const gmailCandidates = gmailTextCandidates(element);
+    if (gmailCandidates.length) {
+      const usableGmail = gmailCandidates.filter((candidate) => candidate.normalized);
+      if (usableGmail.length) {
+        const bestGmail = usableGmail[0];
+        return {
+          text: bestGmail.text,
+          strategy: bestGmail.name,
+          candidates: gmailCandidates.map(candidateSummary)
+        };
+      }
+    }
+
+    candidates.push(textCandidate("generic-block", blockBasedPlainText(element)));
+    candidates.push(textCandidate("inline", inlinePlainText(element)));
+    candidates.push(textCandidate("dom-order", domOrderPlainText(element)));
+
+    const usable = candidates.filter((candidate) => candidate.normalized);
+    if (!usable.length) {
+      return {
+        text: "",
+        strategy: "empty",
+        candidates: candidates.map(candidateSummary)
+      };
+    }
+
+    const best = usable.sort((left, right) => extractionScore(right) - extractionScore(left))[0];
+    return {
+      text: best.text,
+      strategy: best.name,
+      candidates: candidates.map(candidateSummary)
+    };
+  }
+
+  function textCandidate(name, text) {
+    const value = normalizeExtractedText(text);
+    return {
+      name,
+      text: value,
+      length: value.length,
+      lineBreaks: countLineBreaks(value),
+      blankLines: countBlankLines(value),
+      normalized: normalizeExtractionContent(value)
+    };
+  }
+
+  function candidateSummary(candidate) {
+    return {
+      name: candidate.name,
+      length: candidate.length,
+      lineBreaks: candidate.lineBreaks,
+      blankLines: candidate.blankLines,
+      preview: candidate.text.slice(0, 120)
+    };
+  }
+
+  function extractionScore(candidate) {
+    // Prefer candidates that preserve structure. A huge length difference usually
+    // means the candidate captured editor chrome, so length is only a mild bonus.
+    return candidate.lineBreaks * 4 + candidate.blankLines * 8 + Math.min(candidate.length, 2000) / 1000;
+  }
+
+  function normalizeExtractedText(text) {
+    return String(text || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, "")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n[ \t]+/g, "\n")
+      .replace(/\n+$/g, "");
+  }
+
+  function normalizeExtractionContent(text) {
+    return String(text || "").replace(/\s+/g, "");
+  }
+
+  function countBlankLines(text) {
+    return (String(text || "").match(/\n\s*\n/g) || []).length;
+  }
+
+  function blockBasedPlainText(element) {
+    const blockSelector = "p,div,li,h1,h2,h3,h4,h5,h6,blockquote,pre,.se-text-paragraph";
     const blocks = leafTextBlocks(element, blockSelector);
     if (!blocks.length) {
       return inlinePlainText(element);
@@ -186,6 +483,129 @@
 
     const lines = blocks.map((block) => blockPlainText(block));
     return lines.join("\n");
+  }
+
+  function domOrderPlainText(element) {
+    const chunks = [];
+    walkDomOrderText(element, chunks, element, true);
+    return chunks.join("");
+  }
+
+  function walkDomOrderText(node, chunks, root, isRoot = false) {
+    if (!isEditorContentNode(node, root)) return;
+    if (node.nodeType === Node.TEXT_NODE) {
+      chunks.push(node.nodeValue || "");
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const tag = node.tagName ? node.tagName.toLowerCase() : "";
+    if (tag === "br") {
+      chunks.push("\n");
+      return;
+    }
+    const isBlock = !isRoot && isTextBlockElement(node);
+    const beforeLength = chunks.length;
+    Array.from(node.childNodes).forEach((child) => walkDomOrderText(child, chunks, root, false));
+    if (isBlock) {
+      if (chunks.length === beforeLength || !lastChunkEndsWithNewline(chunks)) {
+        chunks.push("\n");
+      }
+    }
+  }
+
+  function lastChunkEndsWithNewline(chunks) {
+    for (let index = chunks.length - 1; index >= 0; index -= 1) {
+      const chunk = String(chunks[index] || "");
+      if (!chunk) continue;
+      return chunk.endsWith("\n");
+    }
+    return false;
+  }
+
+  function isTextBlockElement(element) {
+    if (!element || !element.matches) return false;
+    const tag = element.tagName ? element.tagName.toLowerCase() : "";
+    return ["address", "article", "aside", "blockquote", "dd", "div", "dl", "dt", "figcaption", "figure", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section", "table", "tr", "ul"].includes(tag) ||
+      element.matches(".se-text-paragraph,[role='paragraph']");
+  }
+
+  function gmailTextCandidates(element) {
+    if (!isGmailEditorElement(element)) return [];
+    const root = gmailEditorRoot(element);
+    if (!root) return [];
+    return [
+      textCandidate("gmail-lines", gmailLinesPlainText(root))
+    ];
+  }
+
+  function gmailLinesPlainText(root) {
+    const lines = [];
+    let pendingInline = "";
+
+    Array.from(root.childNodes).forEach((node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        pendingInline += node.nodeValue || "";
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+      const tag = node.tagName ? node.tagName.toLowerCase() : "";
+      if (tag === "br") {
+        lines.push(pendingInline);
+        pendingInline = "";
+        return;
+      }
+
+      if (isGmailLineElement(node)) {
+        if (pendingInline) {
+          lines.push(pendingInline);
+          pendingInline = "";
+        }
+        lines.push(gmailLineText(node));
+        return;
+      }
+
+      pendingInline += inlinePlainText(node);
+    });
+
+    if (pendingInline || !lines.length) {
+      lines.push(pendingInline);
+    }
+    return lines.join("\n");
+  }
+
+  function isGmailLineElement(element) {
+    if (!element || !element.matches) return false;
+    const tag = element.tagName ? element.tagName.toLowerCase() : "";
+    return ["div", "p", "li", "blockquote", "pre"].includes(tag);
+  }
+
+  function gmailLineText(element) {
+    if (isEmptyGmailLine(element)) return "";
+    return inlinePlainText(element);
+  }
+
+  function isEmptyGmailLine(element) {
+    return !normalizedVisibleText(element).trim() && Boolean(element.querySelector("br") || !element.childNodes.length);
+  }
+
+  function isGmailEditorElement(element) {
+    if (!/(\.|^)mail\.google\.com$|(\.|^)googlemail\.com$/.test(location.hostname)) return false;
+    const root = gmailEditorRoot(element);
+    return Boolean(root);
+  }
+
+  function gmailEditorRoot(element) {
+    if (!element || !element.closest) return null;
+    const textboxRoot = element.closest("[contenteditable='true'][role='textbox'],div[aria-label='Message Body'][contenteditable='true']");
+    if (textboxRoot) return textboxRoot;
+    const root = element.closest("[contenteditable='true'][role='textbox'][aria-label],div[aria-label='Message Body'][contenteditable='true'],div[aria-label='편지 본문'][contenteditable='true']");
+    if (!root) return null;
+    const label = `${root.getAttribute("aria-label") || ""} ${root.getAttribute("role") || ""}`.toLowerCase();
+    if (label.includes("message body") || label.includes("편지") || root.getAttribute("role") === "textbox") {
+      return root;
+    }
+    return null;
   }
 
   function leafTextBlocks(element, blockSelector) {
@@ -203,7 +623,24 @@
   }
 
   function isEmptyBlock(block) {
-    return !String(block.textContent || "").trim() && Boolean(block.querySelector("br") || block.children.length === 0);
+    if (normalizedVisibleText(block).trim()) return false;
+    return Boolean(
+      block.querySelector("br") ||
+      block.children.length === 0 ||
+      isEditableLineBlock(block)
+    );
+  }
+
+  function isEditableLineBlock(block) {
+    if (!block || !block.matches) return false;
+    const tag = block.tagName ? block.tagName.toLowerCase() : "";
+    return tag === "p" || tag === "li" || tag === "pre" || block.matches(".se-text-paragraph");
+  }
+
+  function normalizedVisibleText(element) {
+    return String(element?.textContent || "")
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, "")
+      .replace(/\u00a0/g, " ");
   }
 
   function inlinePlainText(element) {
@@ -273,6 +710,8 @@
       });
     }
     return {
+      target: element.tagName ? element.tagName.toLowerCase() : "",
+      targetClass: String(element.className || "").slice(0, 160),
       textPreview: editablePlainText(element).slice(0, 500),
       htmlPreview: (element.innerHTML || "").slice(0, 500),
       childElementCount: element.querySelectorAll("*").length,
@@ -333,7 +772,7 @@
 
   function styleSegmentsFromElement(element, text) {
     if (!text) return [];
-    const blockSelector = "p,div,li,h1,h2,h3,h4,h5,h6,blockquote,pre";
+    const blockSelector = "p,div,li,h1,h2,h3,h4,h5,h6,blockquote,pre,.se-text-paragraph";
     const blocks = leafTextBlocks(element, blockSelector);
     if (blocks.length) {
       const segments = [];
@@ -503,7 +942,7 @@
   }
 
   function observeEditable(element) {
-    if (!element || element.matches("textarea") || observedEditable === element) return;
+    if (!element || isPlainTextControl(element) || observedEditable === element) return;
     if (editableObserver) editableObserver.disconnect();
     observedEditable = element;
     editableObserver = new MutationObserver(() => scheduleCapture());
@@ -521,12 +960,24 @@
   }
 
   async function captureNow() {
-    if (!shouldCaptureDocument()) return;
+    if (!shouldCaptureDocument()) {
+      lastCaptureState = { ready: false, reason: "document_not_focused", sessionId: SESSION_ID, url: location.href };
+      return;
+    }
     const element = activeEditable();
-    if (!element) return;
-    if (!shouldCaptureDocument()) return;
-    const payload = element.matches("textarea") ? captureInput(element) : captureContentEditable(element);
-    if (!payload.text.trim()) return;
+    if (!element) {
+      lastCaptureState = { ready: false, reason: "no_editable_target", sessionId: SESSION_ID, url: location.href };
+      return;
+    }
+    if (!shouldCaptureDocument()) {
+      lastCaptureState = { ready: false, reason: "focus_lost", sessionId: SESSION_ID, url: location.href };
+      return;
+    }
+    const payload = isPlainTextControl(element) ? captureInput(element) : captureContentEditable(element);
+    if (!payload.text.trim()) {
+      lastCaptureState = { ready: false, reason: "empty_text", sessionId: SESSION_ID, url: location.href };
+      return;
+    }
     payload.segments = cleanSegments(payload.segments || []);
     payload.session_id = SESSION_ID;
     payload.url = location.href;
@@ -537,24 +988,34 @@
     if (signature === lastSignature && now - lastCaptureSentAt < 5000) return;
 
     try {
-      const response = await fetch(`${BRIDGE}/capture`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
+      const response = await bridgeRequest("writingAssistantBridgeCapture", { payload });
       if (response.ok) {
         lastSignature = signature;
         lastCaptureSentAt = now;
+        lastCaptureState = {
+          ready: true,
+          reason: "captured",
+          sessionId: SESSION_ID,
+          targetKind: payload.target_kind,
+          extractionStrategy: payload.extraction_strategy || payload.dom_debug?.extractionStrategy || "",
+          textLength: payload.text.length,
+          lineBreaks: countLineBreaks(payload.text),
+          blankLines: countBlankLines(payload.text),
+          preview: payload.text.slice(0, 120),
+          title: document.title,
+          url: location.href
+        };
       }
     } catch (_error) {
       // The desktop app may not be running yet.
+      lastCaptureState = { ready: false, reason: "bridge_unreachable", sessionId: SESSION_ID, url: location.href };
     }
   }
 
   async function pollCommand() {
     try {
-      const response = await fetch(`${BRIDGE}/command?session_id=${encodeURIComponent(SESSION_ID)}`);
-      const data = await response.json();
+      const response = await bridgeRequest("writingAssistantBridgeCommand", { sessionId: SESSION_ID });
+      const data = response.data || response;
       if (data && data.command && data.command.type === "replace_selection") {
         applyReplacement(data.command.text || "", data.command.style_info || {});
         scheduleCapture();
@@ -569,18 +1030,39 @@
   function applyReplacement(text, styleInfo) {
     const element = activeEditable();
     if (!element) return;
-    if (element.matches("textarea")) {
+    if (isPlainTextControl(element)) {
       const start = element.selectionStart || 0;
       const end = element.selectionEnd || start;
-      element.setRangeText(text, start, end, "end");
+      if (typeof element.setRangeText === "function") {
+        element.setRangeText(text, start, end, "end");
+      } else {
+        element.value = `${element.value.slice(0, start)}${text}${element.value.slice(end)}`;
+        const caret = start + String(text).length;
+        element.setSelectionRange?.(caret, caret);
+      }
       element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertReplacementText", data: text }));
       element.dispatchEvent(new Event("change", { bubbles: true }));
+      reportApplied("plain_text_control", text, {}, {
+        actualTargetKind: element.tagName.toLowerCase(),
+        inputType: element.getAttribute("type") || element.type || "",
+        textPreview: String(element.value || "").slice(0, 160)
+      });
       return;
     }
 
     const selection = window.getSelection();
     const range = selectedRangeInside(element) || rangeForElementContents(element);
     const beforeDebug = domDebug(element, range);
+    if (applyNaverSmartEditorReplacement(element, text)) {
+      reportApplied("naver_smart_editor_blocks", text, beforeDebug, domDebug(element, rangeForElementContents(element)));
+      scheduleSettledCaptures();
+      return;
+    }
+    if (!isNaverSmartEditorElement(element) && applyWithNativeInsertText(element, text)) {
+      reportApplied("native_insert_text", text, beforeDebug, domDebug(element, rangeForElementContents(element)));
+      scheduleSettledCaptures();
+      return;
+    }
     if (replaceTextPreservingDom(range, element, text)) {
       selection.removeAllRanges();
       const newRange = document.createRange();
@@ -606,12 +1088,120 @@
     reportApplied("fragment", text, beforeDebug, domDebug(element, rangeForElementContents(element)));
   }
 
+  function applyNaverSmartEditorReplacement(element, text) {
+    if (!isNaverSmartEditorElement(element)) return false;
+    const blocks = smartEditorParagraphBlocks(element);
+    if (!blocks.length) return false;
+
+    const lines = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    const template = blocks.find((block) => block.querySelector("span.__se-node,span")) || blocks[0];
+    let previous = null;
+    const activeBlocks = blocks.slice();
+
+    lines.forEach((line, index) => {
+      let block = activeBlocks[index];
+      if (!block) {
+        block = cloneSmartEditorParagraph(template);
+        insertAfter(previous || activeBlocks[activeBlocks.length - 1] || template, block);
+        activeBlocks.push(block);
+      }
+      setSmartEditorParagraphText(block, line);
+      previous = block;
+    });
+
+    activeBlocks.slice(lines.length).forEach((block) => block.remove());
+    const focusTarget = editableFocusTarget(element) || element;
+    dispatchEditorInputEvents(focusTarget, text);
+    return true;
+  }
+
+  function smartEditorParagraphBlocks(element) {
+    return Array.from(element.querySelectorAll(".se-text-paragraph"))
+      .filter((block) => isEditorContentNode(block, element));
+  }
+
+  function cloneSmartEditorParagraph(template) {
+    const clone = template.cloneNode(true);
+    clone.querySelectorAll("[id]").forEach((node) => node.removeAttribute("id"));
+    clone.querySelectorAll("[data-placeholder]").forEach((node) => node.removeAttribute("data-placeholder"));
+    return clone;
+  }
+
+  function insertAfter(reference, node) {
+    const parent = reference?.parentNode;
+    if (!parent) return;
+    parent.insertBefore(node, reference.nextSibling);
+  }
+
+  function setSmartEditorParagraphText(block, line) {
+    const host = block.querySelector("span.__se-node,span") || block;
+    Array.from(host.childNodes).forEach((child) => child.remove());
+    if (line) {
+      host.appendChild(document.createTextNode(line));
+    } else {
+      host.appendChild(document.createTextNode("\u200b"));
+    }
+  }
+
+  function applyWithNativeInsertText(element, text) {
+    if (!element || !String(text || "")) return false;
+    const focusTarget = editableFocusTarget(element);
+    if (!focusTarget) return false;
+    const selection = window.getSelection();
+    if (!selection) return false;
+
+    try {
+      focusTarget.focus?.({ preventScroll: true });
+    } catch (_error) {
+      try {
+        focusTarget.focus?.();
+      } catch (__error) {
+        // Keep trying with the current document selection.
+      }
+    }
+
+    const range = rangeForElementContents(element);
+    selection.removeAllRanges();
+    selection.addRange(range);
+
+    let applied = false;
+    try {
+      applied = Boolean(document.execCommand?.("insertText", false, String(text)));
+    } catch (_error) {
+      applied = false;
+    }
+    if (!applied) return false;
+
+    dispatchEditorInputEvents(focusTarget, text);
+    return true;
+  }
+
+  function editableFocusTarget(element) {
+    if (!element) return null;
+    if (isPlainTextControl(element) || element.isContentEditable) return element;
+    const active = deepActiveElement();
+    if (active && element.contains(active) && (active.isContentEditable || isPlainTextControl(active))) return active;
+    return element.querySelector?.("[contenteditable='true'],[contenteditable='plaintext-only'],[contenteditable=''],textarea,input") || null;
+  }
+
+  function dispatchEditorInputEvents(element, text) {
+    try {
+      element.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, inputType: "insertReplacementText", data: text }));
+    } catch (_error) {
+      // Some browser/editor combinations do not allow synthetic beforeinput.
+    }
+    try {
+      element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertReplacementText", data: text }));
+    } catch (_error) {
+      element.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
   async function reportApplied(method, text, before, after) {
     try {
-      await fetch(`${BRIDGE}/applied`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      await bridgeRequest("writingAssistantBridgeApplied", {
+        payload: {
           session_id: SESSION_ID,
           method,
           text,
@@ -619,7 +1209,7 @@
           after,
           url: location.href,
           title: document.title
-        })
+        }
       });
     } catch (_error) {
       // Diagnostics are best effort.
@@ -830,8 +1420,48 @@
     }
   }
 
+  function statusTextForElement(element) {
+    if (!element) return "";
+    if (isPlainTextControl(element)) return element.value || "";
+    return editablePlainText(element);
+  }
+
+  function statusExtractionForElement(element) {
+    if (!element) return { text: "", strategy: "" };
+    if (isPlainTextControl(element)) return { text: element.value || "", strategy: "plain-control" };
+    return extractEditableText(element);
+  }
+
+  function countLineBreaks(text) {
+    return (String(text || "").match(/\n/g) || []).length;
+  }
+
+  if (typeof chrome !== "undefined" && chrome.runtime?.onMessage) {
+    chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      if (!message || message.type !== "writingAssistantBridgeStatus") return false;
+      const element = activeEditable();
+      const extraction = statusExtractionForElement(element);
+      const text = extraction.text || "";
+      sendResponse({
+        ...lastCaptureState,
+        sessionId: SESSION_ID,
+        currentTargetKind: element ? (isPlainTextControl(element) ? "textarea" : "contenteditable") : "",
+        currentExtractionStrategy: extraction.strategy || "",
+        currentTextLength: text.length,
+        currentLineBreaks: countLineBreaks(text),
+        currentBlankLines: countBlankLines(text),
+        currentPreview: text.slice(0, 120),
+        title: document.title,
+        url: location.href
+      });
+      return true;
+    });
+  }
+
   document.addEventListener("selectionchange", scheduleCapture, true);
+  document.addEventListener("beforeinput", scheduleSettledCaptures, true);
   document.addEventListener("input", scheduleSettledCaptures, true);
+  document.addEventListener("paste", scheduleSettledCaptures, true);
   document.addEventListener("keyup", scheduleSettledCaptures, true);
   document.addEventListener("mouseup", scheduleSettledCaptures, true);
   document.addEventListener("focusin", scheduleSettledCaptures, true);

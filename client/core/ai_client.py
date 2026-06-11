@@ -1,19 +1,38 @@
-class AIClient:
-    def request(self, prompt):
-        prompt_text = str(prompt or "")
-        if prompt_text.startswith("??\n") or prompt_text.startswith("??? ??\n"):
-            return self.fake_spell_check(prompt_text)
-        if prompt_text.startswith("??\n"):
-            return self.fake_summary(prompt_text)
-        return prompt_text.split("\n", 1)[1] if "\n" in prompt_text else prompt_text
+import requests
 
-    def fake_spell_check(self, text):
-        source_text = text.split("\n", 1)[1] if "\n" in text else text
+
+class AIClient:
+    def __init__(self, base_url="http://127.0.0.1:8765"):
+        self.base_url = base_url.rstrip("/")
+
+    def correct_spelling(self, text):
+        data = self._post("/correct-public", {"text": text})
+        corrected = data.get("corrected_text")
+        if not corrected:
+            raise RuntimeError("맞춤법 검사 응답에 교정문이 없습니다.")
         return {
-            "issues": "",
-            "corrected": source_text,
+            "issues": data.get("spelling_feedback") or "",
+            "corrected": corrected,
+            "corrections": data.get("corrections") or [],
         }
 
-    def fake_summary(self, text):
-        source_text = text.split("\n", 1)[1] if "\n" in text else text
-        return source_text.strip()
+    def request(self, prompt):
+        return self.correct_spelling(prompt)
+
+    def _post(self, path, payload):
+        response = requests.post(
+            f"{self.base_url}{path}",
+            json=payload,
+            timeout=90,
+        )
+        return self._handle_response(response)
+
+    @staticmethod
+    def _handle_response(response):
+        try:
+            data = response.json()
+        except Exception:
+            data = {"detail": response.text}
+        if response.status_code >= 400:
+            raise RuntimeError(data.get("detail", "AI request failed."))
+        return data

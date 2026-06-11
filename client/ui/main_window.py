@@ -1,4 +1,5 @@
 import json
+import hashlib
 import sys
 import threading
 import time
@@ -13,6 +14,7 @@ from PyQt5.QtWidgets import QAction, QApplication, QMenu, QStyle, QSystemTrayIco
 from client.app_settings import DEFAULT_SETTINGS, load_app_settings, save_app_settings
 from client.core.auth_api_client import AuthAPIClient, UnauthorizedError
 from client.core.analyzer import TextAnalyzer
+from client.core.beta_client import BetaAIClient
 from client.core.line_structure import preserve_replacement_structure
 from client.core.local_server import LocalServer
 from client.input.clipboard_monitor import monitor_clipboard
@@ -29,12 +31,14 @@ _LOG_DIR.mkdir(parents=True, exist_ok=True)
 _UI_INPUT_EVENT_LOG_PATH = _LOG_DIR / "ui_input_events.log"
 _REPLACEMENT_STRUCTURE_LOG_PATH = _LOG_DIR / "replacement_structure.log"
 _DRAG_APPLY_LOG_PATH = _LOG_DIR / "drag_apply.log"
+_BETA_FEATURE_LOG_PATH = _LOG_DIR / "beta_features.jsonl"
 
 
 class SignalBridge(QObject):
     text_signal = pyqtSignal(object)
     auth_sync_signal = pyqtSignal(object)
     hotkey_signal = pyqtSignal(object)
+    spelling_signal = pyqtSignal(object)
 
 
 class App:
@@ -72,14 +76,22 @@ class App:
         self.panel.set_replace_mode_checked(
             self.settings.get("replace_mode", False)
         )
+        self.panel.set_beta_enabled_checked(
+            self.settings.get("beta_enabled", True)
+        )
 
         self.analyzer = TextAnalyzer()
+        self.beta_ai = BetaAIClient()
         self.output_applier = None
         self.last_input = ""
         self.last_corrected_text = ""
         self.last_correction_source_text = ""
+        self.spelling_request_id = 0
+        self.pending_spell_check_request = None
+        self.spelling_worker_running = False
         self.last_evaluation_reason = ""
         self.last_output_target = None
+        self.last_browser_extension_output_target = None
         self.tone_favorites = []
         self._clear_recent_drag_snapshot()
         self.suppress_replacement_echo_until = 0.0
@@ -128,17 +140,21 @@ class App:
         self.main_overlay_timer = QTimer(self.qt_app)
         self.main_overlay_timer.setInterval(140)
         self.main_overlay_timer.timeout.connect(self.update_main_overlay_presence)
+        self.spell_check_timer = QTimer(self.qt_app)
+        self.spell_check_timer.setSingleShot(True)
+        self.spell_check_timer.timeout.connect(self._start_pending_spell_check)
 
         self.signals = SignalBridge()
         self.signals.text_signal.connect(self.handle_input_event)
         self.signals.auth_sync_signal.connect(self.handle_background_auth_sync_result)
         self.signals.hotkey_signal.connect(self.handle_hotkey_event)
+        self.signals.spelling_signal.connect(self.handle_spell_check_result)
 
         self.panel.set_input_mode(self.active_input_mode)
         self.reset_session_state()
 
         self.panel.copy_btn.clicked.connect(self.copy_result)
-        self.panel.refresh_btn.clicked.connect(self.run_spell_check)
+        self.panel.refresh_btn.clicked.connect(lambda: self.run_spell_check(debounce_ms=0))
         self.panel.apply_correction_btn.clicked.connect(self.apply_correction_to_source)
         self.panel.quit_btn.clicked.connect(self.quit_app)
         self.panel.evaluate_btn.clicked.connect(self.run_evaluation)
@@ -146,6 +162,14 @@ class App:
         self.panel.recommend_title_btn.clicked.connect(self.run_title_recommendation)
         self.panel.run_summary_btn.clicked.connect(self.run_summary)
         self.panel.run_tone_btn.clicked.connect(self.run_tone_change)
+        self.panel.beta_correction_cards_btn.clicked.connect(lambda: self.run_beta_feature("correction_cards"))
+        self.panel.beta_sentence_polish_btn.clicked.connect(lambda: self.run_beta_feature("sentence_polish"))
+        self.panel.beta_reply_btn.clicked.connect(lambda: self.run_beta_feature("reply"))
+        self.panel.beta_purpose_btn.clicked.connect(lambda: self.run_beta_feature("purpose"))
+        self.panel.beta_risk_btn.clicked.connect(lambda: self.run_beta_feature("risk"))
+        self.panel.beta_voice_btn.clicked.connect(lambda: self.run_beta_feature("voice"))
+        self.panel.beta_temperature_btn.clicked.connect(lambda: self.run_beta_feature("temperature"))
+        self.panel.beta_oneclick_btn.clicked.connect(lambda: self.run_beta_feature("oneclick"))
         self.panel.save_settings_btn.clicked.connect(self.save_settings)
         self.panel.close_settings_btn.clicked.connect(self.panel.close_settings_page)
         self.panel.login_btn.clicked.connect(self.handle_login_button)
@@ -209,7 +233,14 @@ class App:
         QTimer.singleShot(0, self.start_restored_login_sync)
 
     def initialize_auth(self):
-        self.api_client.try_restore_session()
+        try:
+            self.api_client.try_restore_session()
+        except Exception as exc:
+            self._startup_server_error = str(exc)
+            try:
+                self.api_client.clear_token()
+            except Exception:
+                pass
 
     def load_app_font(self):
         font_path = Path(__file__).resolve().parent.parent / "assets" / "fonts" / "A2Z-Medium.ttf"
@@ -1878,6 +1909,9 @@ class App:
         self.last_input = ""
         self.last_corrected_text = ""
         self.last_correction_source_text = ""
+        self.spelling_request_id = 0
+        self.pending_spell_check_request = None
+        self.spelling_worker_running = False
         self.last_evaluation_reason = ""
         self.last_output_target = None
         self.suppress_replacement_echo_text = ""
@@ -1886,6 +1920,7 @@ class App:
         self.panel.clear_spell_result()
         self.panel.clear_summary_result()
         self.panel.clear_tone_result()
+        self.panel.clear_beta_result()
         self.last_drag_selection_signature = None
         self.pending_word_clear_at = 0.0
         self.mini_overlay.clear_selection(reader_name, window_handle)
@@ -1980,8 +2015,11 @@ class App:
         self.last_input = text
         self.last_corrected_text = ""
         self.last_output_target = incoming_output_target
+        if reader_name == "browser_extension" and incoming_output_target is not None:
+            self.last_browser_extension_output_target = incoming_output_target
         self.panel.set_original_text(text)
-        self.run_spell_check()
+        if self._should_run_auto_spell_check(source, reader_name, incoming_output_target):
+            self.run_spell_check()
         if source == "drag" and self.last_output_target is not None:
             self._remember_recent_drag_snapshot()
             self._log_drag_apply(
@@ -1999,7 +2037,11 @@ class App:
         self.last_input = ""
         self.last_corrected_text = ""
         self.last_correction_source_text = ""
+        self.spelling_request_id = 0
+        self.pending_spell_check_request = None
+        self.spelling_worker_running = False
         self.last_output_target = None
+        self.last_browser_extension_output_target = None
         self._clear_recent_drag_snapshot()
         self.suppress_replacement_echo_until = 0.0
         self.suppress_replacement_echo_text = ""
@@ -2007,6 +2049,7 @@ class App:
         self.panel.clear_spell_result()
         self.panel.clear_summary_result()
         self.panel.clear_tone_result()
+        self.panel.clear_beta_result()
         self.panel.set_active_window_title("")
         self._hide_mini_overlay("main_window_hide_call")
         self._hide_main_overlay("main_window_hide_call")
@@ -2039,12 +2082,92 @@ class App:
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
             self.show_panel()
 
-    def run_spell_check(self):
+    def run_spell_check(self, blocking=False, debounce_ms=1500):
         if not self.last_input:
             return
-        self.last_correction_source_text = self.last_input
-        result = self.analyzer.analyze_spelling(self.last_correction_source_text)
-        spelling_feedback = self.analyzer.TEMP_SPELLING_FEEDBACK
+        source_text = self.last_input
+        self.spelling_request_id += 1
+        request_id = self.spelling_request_id
+        self.last_correction_source_text = source_text
+        self.last_corrected_text = ""
+        self.panel.set_spell_result("맞춤법 검사 중입니다...")
+        if blocking:
+            self.spell_check_timer.stop()
+            self.pending_spell_check_request = None
+            payload = self._perform_spell_check_request(request_id, source_text)
+            self.handle_spell_check_result(payload)
+            return payload.get("result", "")
+        self.pending_spell_check_request = (request_id, source_text)
+        self.spell_check_timer.start(max(0, int(debounce_ms)))
+        return ""
+
+    def _start_pending_spell_check(self):
+        pending = self.pending_spell_check_request
+        if not pending:
+            return
+        if self.spelling_worker_running:
+            self.spell_check_timer.start(350)
+            return
+        request_id, source_text = pending
+        self.pending_spell_check_request = None
+        self.spelling_worker_running = True
+        threading.Thread(
+            target=self._run_spell_check_worker,
+            args=(request_id, source_text),
+            daemon=True,
+        ).start()
+
+    def _run_spell_check_worker(self, request_id, source_text):
+        self.signals.spelling_signal.emit(
+            self._perform_spell_check_request(request_id, source_text)
+        )
+
+    def _should_run_auto_spell_check(self, source, reader_name, output_target):
+        if source == "drag":
+            return True
+        if source != "realtime":
+            return False
+        reader = str(reader_name or "")
+        mode = str(getattr(output_target, "mode", "") or "")
+        if reader in {"browser", "browser_extension"} or mode in {"browser", "browser_extension"}:
+            return False
+        return True
+
+    def _perform_spell_check_request(self, request_id, source_text):
+        try:
+            self.local_server.ensure_running()
+            analyzer = TextAnalyzer()
+            result = analyzer.analyze_spelling(source_text)
+            return {
+                "request_id": request_id,
+                "source_text": source_text,
+                "result": result,
+                "feedback": analyzer.last_spelling_feedback or analyzer.TEMP_SPELLING_FEEDBACK,
+                "error": "",
+            }
+        except Exception as exc:
+            return {
+                "request_id": request_id,
+                "source_text": source_text,
+                "result": "",
+                "feedback": "",
+                "error": str(exc),
+            }
+
+    def handle_spell_check_result(self, payload):
+        self.spelling_worker_running = False
+        if self.pending_spell_check_request:
+            self.spell_check_timer.start(150)
+        if payload.get("request_id") != self.spelling_request_id:
+            return
+        if payload.get("source_text") != self.last_correction_source_text:
+            return
+        if payload.get("error"):
+            self.last_corrected_text = ""
+            self.panel.set_spell_result(f"맞춤법 검사 실패:\n\n{payload['error']}")
+            return
+        result = payload.get("result") or ""
+        spelling_feedback = payload.get("feedback") or TextAnalyzer.DEFAULT_SPELLING_FEEDBACK
         self.last_corrected_text = self._extract_corrected_text(result)
         self.panel.set_spell_result(result)
         self.save_history_log(
@@ -2053,15 +2176,17 @@ class App:
             output_text=self.last_corrected_text,
             spelling_feedback=spelling_feedback,
         )
-
     def apply_correction_to_source(self):
         spelling_replacement_enabled = self._can_apply_spelling_source_replacement()
+        browser_extension_target = self._recent_browser_extension_output_target()
         if self.active_input_mode == "realtime":
             if self.realtime_overlay_anchor and self.last_output_target is None:
                 self.last_output_target = self._output_target_from_anchor(self.realtime_overlay_anchor)
             self._refresh_realtime_overlay_input()
+            if self._should_restore_browser_extension_target(browser_extension_target):
+                self.last_output_target = browser_extension_target
             if self.last_input:
-                self.run_spell_check()
+                self.run_spell_check(blocking=True)
         if self.active_input_mode == "drag":
             self.mark_drag_overlay_interaction()
             self._log_drag_apply(
@@ -2094,6 +2219,8 @@ class App:
         if not spelling_replacement_enabled:
             self.show_spelling_inspection_guides()
             return
+        if self._should_restore_browser_extension_target(browser_extension_target):
+            self.last_output_target = browser_extension_target
         text = self.last_corrected_text or self._extract_corrected_text(self.panel.spell_box.toPlainText())
         if not text:
             self.panel.set_spell_result("\ub9de\ucda4\ubc95 \uc218\uc815 \uacb0\uacfc\uac00 \uc5c6\uc2b5\ub2c8\ub2e4.")
@@ -2684,6 +2811,26 @@ class App:
     def _can_apply_tone_source_replacement(self):
         return self.active_input_mode in {"drag", "realtime"} or self.panel.get_replace_mode_checked()
 
+    def _recent_browser_extension_output_target(self, max_age=120.0):
+        target = self.last_browser_extension_output_target
+        if target is None:
+            return None
+        if str(getattr(target, "mode", "") or "") != "browser_extension":
+            return None
+        if time.monotonic() - self.last_browser_extension_event_at > max_age:
+            return None
+        style_info = getattr(target, "style_info", None) or {}
+        if not style_info.get("browser_session_id"):
+            return None
+        return target
+
+    def _should_restore_browser_extension_target(self, browser_extension_target):
+        if browser_extension_target is None:
+            return False
+        if self.last_output_target is None:
+            return True
+        return str(getattr(self.last_output_target, "mode", "") or "") == "browser"
+
     def _build_output_target(self, event):
         reader_name = str(event.get("reader", "")).strip()
         if reader_name not in {"browser", "browser_extension", "notepad", "notepad_selection", "word", "word_selection", "hwp"}:
@@ -3063,6 +3210,72 @@ class App:
         )
         self.maybe_prompt_tone_favorite(tone)
 
+    def run_beta_feature(self, mode="correction_cards"):
+        if not self.settings.get("beta_enabled", True):
+            self.panel.set_beta_result("Beta 기능이 설정에서 꺼져 있습니다.")
+            return ""
+        if not self.last_input:
+            self.panel.set_beta_result("Beta 기능을 실행할 텍스트가 없습니다.")
+            self.panel.tabs.setCurrentIndex(4)
+            self._log_beta_feature_event("skipped_empty_input", mode=mode)
+            return ""
+
+        self.panel.tabs.setCurrentIndex(4)
+        self.panel.resize(max(self.panel.width(), 920), max(self.panel.height(), 620))
+        self.panel.set_beta_result("Beta 기능 실행 중...")
+        QApplication.processEvents()
+
+        started_at = time.monotonic()
+        self._log_beta_feature_event("request_started", mode=mode, **self._beta_text_ref(self.last_input))
+        try:
+            self.local_server.ensure_running()
+            result = self.beta_ai.run(self.last_input, mode)
+        except Exception as exc:
+            message = f"Beta 기능 실패:\n{exc}"
+            self.panel.set_beta_result(message)
+            self._log_beta_feature_event(
+                "request_failed",
+                mode=mode,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+                **self._beta_text_ref(self.last_input),
+            )
+            return message
+
+        self.panel.set_beta_result_data(result, source_text=self.last_input)
+        self._log_beta_feature_event(
+            "request_completed",
+            mode=mode,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+            result=result,
+            card_count=len(result.get("cards") or []) if isinstance(result, dict) else 0,
+            **self._beta_text_ref(self.last_input),
+        )
+        return result
+
+    def _beta_text_ref(self, text):
+        value = str(text or "")
+        return {
+            "text_len": len(value),
+            "text_lines": value.count("\n") + (1 if value else 0),
+            "text_hash": hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:16],
+            "text_preview": value[:300],
+        }
+
+    def _log_beta_feature_event(self, event, **fields):
+        payload = {
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "source": "client",
+            "event": event,
+            **fields,
+        }
+        try:
+            _BETA_FEATURE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _BETA_FEATURE_LOG_PATH.open("a", encoding="utf-8") as log_file:
+                log_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     def history_feature_label(self, feature_type):
         return {
@@ -3196,6 +3409,7 @@ class App:
         input_mode = normalized.get("input_mode")
         normalized["input_mode"] = input_mode if input_mode in {"clipboard", "drag", "realtime"} else "clipboard"
         normalized["replace_mode"] = bool(normalized.get("replace_mode", False))
+        normalized["beta_enabled"] = bool(normalized.get("beta_enabled", True))
         return normalized
 
     def collect_settings_from_panel(self):
@@ -3203,6 +3417,7 @@ class App:
         settings["default_dark_mode"] = self.panel.get_default_dark_mode_checked()
         settings["input_mode"] = self.panel.get_input_mode()
         settings["replace_mode"] = self.panel.get_replace_mode_checked()
+        settings["beta_enabled"] = self.panel.get_beta_enabled_checked()
         if self.is_logged_in():
             settings["history_enabled"] = self.panel.get_history_enabled_checked()
         return self.normalize_settings(settings)
@@ -3218,6 +3433,7 @@ class App:
         self.panel.set_history_enabled_checked(self.settings["history_enabled"])
         self.panel.set_input_mode(self.settings["input_mode"])
         self.panel.set_replace_mode_checked(self.settings["replace_mode"])
+        self.panel.set_beta_enabled_checked(self.settings["beta_enabled"])
         self.update_login_state()
         if self.settings["replace_mode"]:
             self.spelling_inspection_overlay.clear()
@@ -3262,7 +3478,12 @@ class App:
             return False
         if not self.ensure_server_available():
             return False
-        self.api_client.update_settings(self.settings)
+        remote_settings = {
+            key: self.settings[key]
+            for key in ("default_dark_mode", "history_enabled", "input_mode", "replace_mode")
+            if key in self.settings
+        }
+        self.api_client.update_settings(remote_settings)
         return True
 
     def load_remote_settings(self):

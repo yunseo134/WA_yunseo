@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -24,6 +25,18 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+def _screen_key(screen):
+    if screen is None:
+        return ""
+    try:
+        return f"{screen.name()}:{screen.devicePixelRatio()}:{screen.geometry().getRect()}"
+    except Exception:
+        return str(id(screen))
+
+
+_BETA_FEATURE_LOG_PATH = Path(__file__).resolve().parents[2] / ".logs" / "beta_features.jsonl"
 
 
 class ResultPanel(QWidget):
@@ -107,6 +120,11 @@ class ResultPanel(QWidget):
         self.resize_start_geometry = None
         self.resize_margin = 10
         self._centered_once = False
+        self._screen_key = ""
+        self._screen_signal_connected = False
+        self._screen_adjust_timer = QTimer(self)
+        self._screen_adjust_timer.setSingleShot(True)
+        self._screen_adjust_timer.timeout.connect(self._settle_after_screen_change)
         self._theme_mix = 1.0 if initial_dark_mode else 0.0
 
         self.setWindowTitle("Writing Assistant")
@@ -136,6 +154,7 @@ class ResultPanel(QWidget):
         self.clear_spell_result()
         self.clear_summary_result()
         self.clear_tone_result()
+        self.clear_beta_result()
         self.clear_evaluation_score()
         self.clear_title_recommendation()
 
@@ -240,6 +259,11 @@ class ResultPanel(QWidget):
         self.spell_box = self._create_text_box("")
         self.summary_box = self._create_text_box("")
         self.tone_box = self._create_text_box("")
+        self.beta_box = self._create_text_box("")
+        self.beta_box.setObjectName("betaResultBox")
+        self.beta_box.setMinimumHeight(64)
+        self.beta_box.setMaximumHeight(104)
+        self._beta_preview_text = ""
 
         self.evaluate_btn = QPushButton("평가")
         self.evaluate_btn.setObjectName("secondaryButton")
@@ -262,6 +286,40 @@ class ResultPanel(QWidget):
         self.run_tone_btn = QPushButton("변경")
         self.run_tone_btn.setObjectName("secondaryButton")
         self.tone_history_btn = self._create_history_button()
+        self.beta_correction_cards_btn = QPushButton("선택 교정")
+        self.beta_sentence_polish_btn = QPushButton("현재 문장")
+        self.beta_reply_btn = QPushButton("답장 초안")
+        self.beta_purpose_btn = QPushButton("글 목적")
+        self.beta_risk_btn = QPushButton("위험 감지")
+        self.beta_voice_btn = QPushButton("내 말투")
+        self.beta_temperature_btn = QPushButton("온도계")
+        self.beta_oneclick_btn = QPushButton("원클릭 정리")
+        for button in (
+            self.beta_correction_cards_btn,
+            self.beta_sentence_polish_btn,
+            self.beta_reply_btn,
+            self.beta_purpose_btn,
+            self.beta_risk_btn,
+            self.beta_voice_btn,
+            self.beta_temperature_btn,
+            self.beta_oneclick_btn,
+        ):
+            button.setObjectName("secondaryButton")
+            button.setMinimumHeight(28)
+            button.setMaximumHeight(32)
+        self.beta_card_scroll = QScrollArea()
+        self.beta_card_scroll.setObjectName("betaCardScroll")
+        self.beta_card_scroll.setWidgetResizable(True)
+        self.beta_card_scroll.setFrameShape(QFrame.NoFrame)
+        self.beta_card_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.beta_card_scroll.setMinimumHeight(120)
+        self.beta_card_content = QWidget()
+        self.beta_card_layout = QVBoxLayout(self.beta_card_content)
+        self.beta_card_layout.setContentsMargins(0, 0, 8, 0)
+        self.beta_card_layout.setSpacing(8)
+        self.beta_card_layout.addStretch()
+        self.beta_card_scroll.setWidget(self.beta_card_content)
+        self.beta_card_scroll.hide()
         self.history_buttons = (
             self.text_history_btn,
             self.spell_history_btn,
@@ -365,6 +423,8 @@ class ResultPanel(QWidget):
         self.drag_mode_checkbox.setObjectName("settingsCheck")
         self.realtime_mode_checkbox = QCheckBox("실시간 인식 사용")
         self.realtime_mode_checkbox.setObjectName("settingsCheck")
+        self.beta_enabled_checkbox = QCheckBox("Beta 기능 탭 사용")
+        self.beta_enabled_checkbox.setObjectName("settingsCheck")
         self.replace_mode_checkbox = QCheckBox("수정 방식 사용")
         self.replace_mode_checkbox.setObjectName("settingsSubCheck")
         self.replace_mode_checkbox.setText("\ub9de\ucda4\ubc95 \uc218\uc815 \ubc29\uc2dd \uc0ac\uc6a9")
@@ -393,6 +453,7 @@ class ResultPanel(QWidget):
         self.tabs.addTab(self._create_spell_tab(), "교정")
         self.tabs.addTab(self._create_action_tab(self.summary_box, self.run_summary_btn), "요약")
         self.tabs.addTab(self._create_tone_tab(), "문체")
+        self.tabs.addTab(self._create_beta_tab(), "Beta")
         self.tabs.currentChanged.connect(self.update_copy_button_label)
 
         self.settings_page = self._create_settings_tab()
@@ -733,6 +794,33 @@ class ResultPanel(QWidget):
         layout.addWidget(self.tone_box, 1)
         return page
 
+    def _create_beta_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        button_grid = QGridLayout()
+        button_grid.setContentsMargins(0, 0, 8, 0)
+        button_grid.setSpacing(6)
+        buttons = (
+            self.beta_correction_cards_btn,
+            self.beta_sentence_polish_btn,
+            self.beta_reply_btn,
+            self.beta_purpose_btn,
+            self.beta_risk_btn,
+            self.beta_voice_btn,
+            self.beta_temperature_btn,
+            self.beta_oneclick_btn,
+        )
+        for index, button in enumerate(buttons):
+            button_grid.addWidget(button, 0, index)
+
+        layout.addLayout(button_grid)
+        layout.addWidget(self.beta_box, 0)
+        layout.addWidget(self.beta_card_scroll, 1)
+        return page
+
     def _create_history_button(self):
         button = QPushButton("")
         button.setObjectName("iconButton")
@@ -795,6 +883,8 @@ class ResultPanel(QWidget):
         section.addWidget(self.default_dark_mode_checkbox)
         section.addSpacing(4)
         section.addWidget(self.history_enabled_checkbox)
+        section.addSpacing(4)
+        section.addWidget(self.beta_enabled_checkbox)
         section.addSpacing(4)
         section.addWidget(self.clipboard_mode_checkbox)
         section.addSpacing(4)
@@ -1533,6 +1623,32 @@ class ResultPanel(QWidget):
                 selection-background-color: {colors["accent"]};
                 selection-color: {colors["accent_text"]};
             }}
+            QTextEdit#betaResultBox {{
+                border: 1px solid {colors["editor_border"]};
+                border-radius: 14px;
+                padding: 16px;
+                font-size: 11pt;
+            }}
+            QScrollArea#betaCardScroll {{
+                background: transparent;
+                border: none;
+            }}
+            QFrame#betaCard {{
+                background: {colors["editor_bg"]};
+                border: 1px solid {colors["editor_border"]};
+                border-radius: 8px;
+            }}
+            QLabel#betaCardTitle {{
+                color: {colors["title"]};
+                font-size: 10pt;
+                font-weight: 700;
+            }}
+            QLabel#betaCardBody,
+            QLabel#betaCardMeta,
+            QLabel#betaCardReason {{
+                color: {colors["text"]};
+                font-size: 9pt;
+            }}
             QScrollBar:vertical {{
                 background: transparent;
                 width: 10px;
@@ -1785,9 +1901,59 @@ class ResultPanel(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._ensure_screen_signal()
         if not self._centered_once:
             self.center_on_screen()
             self._centered_once = True
+        self._remember_current_screen()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._handle_possible_screen_change()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._handle_possible_screen_change()
+
+    def _ensure_screen_signal(self):
+        if self._screen_signal_connected:
+            return
+        handle = self.windowHandle()
+        if handle is None:
+            return
+        handle.screenChanged.connect(self._on_window_screen_changed)
+        self._screen_signal_connected = True
+
+    def _remember_current_screen(self):
+        self._screen_key = _screen_key(self.screen() or (self.windowHandle().screen() if self.windowHandle() else None))
+
+    def _handle_possible_screen_change(self):
+        screen = self.screen() or (self.windowHandle().screen() if self.windowHandle() else None)
+        key = _screen_key(screen)
+        if key and key != self._screen_key:
+            self._screen_key = key
+            self._on_window_screen_changed(screen)
+
+    def _on_window_screen_changed(self, _screen):
+        self._screen_adjust_timer.start(80)
+
+    def _settle_after_screen_change(self):
+        self._keep_on_current_screen()
+        self.updateGeometry()
+        self.repaint()
+
+    def _keep_on_current_screen(self):
+        screen = self.screen() or (self.windowHandle().screen() if self.windowHandle() else None) or QApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        geometry = self.geometry()
+        width = min(max(geometry.width(), self.minimumWidth()), max(self.minimumWidth(), available.width()))
+        height = min(max(geometry.height(), self.minimumHeight()), max(self.minimumHeight(), available.height()))
+        x = min(max(geometry.x(), available.left()), available.right() - width + 1)
+        y = min(max(geometry.y(), available.top()), available.bottom() - height + 1)
+        if (x, y, width, height) != (geometry.x(), geometry.y(), geometry.width(), geometry.height()):
+            self.setGeometry(x, y, width, height)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -1813,6 +1979,7 @@ class ResultPanel(QWidget):
             return
         if self.drag_active and event.buttons() & Qt.LeftButton:
             self.move(event.globalPos() - self.drag_position)
+            self._handle_possible_screen_change()
             event.accept()
             return
         self._update_resize_cursor(event.pos())
@@ -1823,6 +1990,7 @@ class ResultPanel(QWidget):
         self.resize_active = False
         self.resize_edge = ""
         self.resize_start_geometry = None
+        self._settle_after_screen_change()
         self.unsetCursor()
         super().mouseReleaseEvent(event)
 
@@ -1980,6 +2148,31 @@ class ResultPanel(QWidget):
 
     def get_history_enabled_checked(self):
         return self.history_enabled_checkbox.isEnabled() and self.history_enabled_checkbox.isChecked()
+
+    def set_beta_enabled_checked(self, enabled):
+        checked = bool(enabled)
+        self.beta_enabled_checkbox.setChecked(checked)
+        self.set_beta_tab_enabled(checked)
+
+    def get_beta_enabled_checked(self):
+        return self.beta_enabled_checkbox.isChecked()
+
+    def set_beta_tab_enabled(self, enabled):
+        beta_index = self._beta_tab_index()
+        if beta_index < 0:
+            return
+        if not enabled and self.tabs.currentIndex() == beta_index:
+            self.tabs.setCurrentIndex(0)
+        try:
+            self.tabs.setTabVisible(beta_index, bool(enabled))
+        except AttributeError:
+            self.tabs.setTabEnabled(beta_index, bool(enabled))
+
+    def _beta_tab_index(self):
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index) == "Beta":
+                return index
+        return -1
 
     def _sync_history_setting_access(self):
         is_logged_in = bool(getattr(self, "_is_logged_in", False))
@@ -2156,6 +2349,7 @@ class ResultPanel(QWidget):
         self.clear_evaluation_score()
         self.clear_title_recommendation()
         self.clear_tone_result()
+        self.clear_beta_result()
         self.clear_spell_result()
 
     def set_original_text(self, text):
@@ -2167,6 +2361,7 @@ class ResultPanel(QWidget):
         self.clear_evaluation_score()
         self.clear_title_recommendation()
         self.clear_tone_result()
+        self.clear_beta_result()
 
     def _render_original_text(self, previous_text=""):
         scrollbar = self.text_box.verticalScrollBar()
@@ -2224,6 +2419,16 @@ class ResultPanel(QWidget):
             "</div>"
         )
 
+    def clear_beta_result(self):
+        self.beta_box.clear()
+        self._beta_preview_text = ""
+        self._clear_beta_cards()
+        self.beta_box.setHtml(
+            '<div style="color: #9b8a7f;">'
+            "<div>Beta 기능 결과가 여기에 표시됩니다.</div>"
+            "</div>"
+        )
+
     def set_spell_result(self, text):
         self.spell_box.setPlainText(text)
 
@@ -2232,6 +2437,158 @@ class ResultPanel(QWidget):
 
     def set_tone_result(self, text):
         self.tone_box.setPlainText(text)
+
+    def set_beta_result(self, text):
+        self._clear_beta_cards()
+        self.beta_box.setPlainText(text)
+
+    def set_beta_result_data(self, data, source_text=""):
+        title = str(data.get("title") or "Beta").strip()
+        result_text = str(data.get("result_text") or "").strip()
+        cards = data.get("cards") if isinstance(data.get("cards"), list) else []
+        self._beta_preview_text = result_text or str(source_text or "")
+
+        preview = [f"[{title}]", ""]
+        preview.append(self._beta_preview_text or "표시할 결과가 없습니다.")
+        self.beta_box.setPlainText("\n".join(preview).rstrip())
+        self._render_beta_cards(cards)
+
+    def _clear_beta_cards(self):
+        if not hasattr(self, "beta_card_layout"):
+            return
+        while self.beta_card_layout.count() > 1:
+            item = self.beta_card_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.beta_card_scroll.hide()
+
+    def _render_beta_cards(self, cards):
+        self._clear_beta_cards()
+        if not cards:
+            return
+        for index, card in enumerate(cards):
+            if isinstance(card, dict):
+                self.beta_card_layout.insertWidget(index, self._create_beta_card(card))
+        self.beta_card_scroll.show()
+
+    def _create_beta_card(self, card):
+        frame = QFrame()
+        frame.setObjectName("betaCard")
+        frame.setFrameShape(QFrame.StyledPanel)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(4)
+
+        label = str(card.get("label") or card.get("category") or "카드").strip()
+        original = str(card.get("original") or "").strip()
+        suggestion = str(card.get("suggestion") or "").strip()
+        text = str(card.get("text") or "").strip()
+        reason = str(card.get("reason") or "").strip()
+        score = str(card.get("score") or "").strip()
+
+        title = QLabel(label)
+        title.setObjectName("betaCardTitle")
+        title.setWordWrap(False)
+        title.setMaximumHeight(22)
+        layout.addWidget(title)
+
+        if original or suggestion:
+            body_text = f"{original or '(원문 없음)'}  →  {suggestion or '(제안 없음)'}"
+        else:
+            body_text = text or score or reason
+        body = QLabel(body_text)
+        body.setObjectName("betaCardBody")
+        body.setWordWrap(True)
+        body.setMaximumHeight(44)
+        body.setToolTip(body_text)
+        body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(body)
+
+        if score and score not in body_text:
+            score_label = QLabel(score)
+            score_label.setObjectName("betaCardMeta")
+            score_label.setWordWrap(True)
+            score_label.setMaximumHeight(22)
+            score_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            layout.addWidget(score_label)
+
+        reason_label = QLabel(reason or "설명이 제공되지 않았습니다.")
+        reason_label.setObjectName("betaCardReason")
+        reason_label.setWordWrap(True)
+        reason_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        reason_label.hide()
+        layout.addWidget(reason_label)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(4)
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.addStretch()
+        apply_btn = QPushButton(str(card.get("primary_action") or "적용"))
+        ignore_btn = QPushButton(str(card.get("secondary_action") or "무시"))
+        why_btn = QPushButton("왜?")
+        for button in (apply_btn, ignore_btn, why_btn):
+            button.setObjectName("secondaryButton")
+            button.setFixedHeight(26)
+            button.setMinimumWidth(58)
+            button.setMaximumWidth(92)
+        apply_btn.clicked.connect(
+            lambda _=False, c=card, b=apply_btn: self._apply_beta_card(c, b)
+        )
+        ignore_btn.clicked.connect(
+            lambda _=False, b=ignore_btn, a=apply_btn: self._ignore_beta_card(b, a)
+        )
+        why_btn.clicked.connect(lambda _=False, w=reason_label: w.setVisible(not w.isVisible()))
+        button_row.addWidget(apply_btn)
+        button_row.addWidget(ignore_btn)
+        button_row.addWidget(why_btn)
+        layout.addLayout(button_row)
+        return frame
+
+    def _apply_beta_card(self, card, button):
+        original = str(card.get("original") or "").strip()
+        suggestion = str(card.get("suggestion") or "").strip()
+        self._log_beta_ui_event(
+            "card_apply_clicked",
+            label=str(card.get("label") or ""),
+            original=original,
+            suggestion=suggestion,
+            has_reason=bool(str(card.get("reason") or "").strip()),
+        )
+        if not suggestion:
+            button.setText("확인됨")
+            button.setEnabled(False)
+            return
+        if original and original in self._beta_preview_text:
+            self._beta_preview_text = self._beta_preview_text.replace(original, suggestion, 1)
+        elif self._beta_preview_text:
+            self._beta_preview_text = f"{self._beta_preview_text}\n\n{suggestion}"
+        else:
+            self._beta_preview_text = suggestion
+        current_title = self.beta_box.toPlainText().splitlines()[0] if self.beta_box.toPlainText() else "[Beta]"
+        self.beta_box.setPlainText(f"{current_title}\n\n{self._beta_preview_text}".rstrip())
+        button.setText("적용됨")
+        button.setEnabled(False)
+
+    def _ignore_beta_card(self, ignore_button, apply_button):
+        self._log_beta_ui_event("card_ignore_clicked")
+        ignore_button.setText("무시됨")
+        ignore_button.setEnabled(False)
+        apply_button.setEnabled(False)
+
+    def _log_beta_ui_event(self, event, **fields):
+        payload = {
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "source": "ui",
+            "event": event,
+            **fields,
+        }
+        try:
+            _BETA_FEATURE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _BETA_FEATURE_LOG_PATH.open("a", encoding="utf-8") as log_file:
+                log_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     def update_login_state(self, is_logged_in, username="", history_enabled=False):
         self._is_logged_in = bool(is_logged_in)
@@ -2279,4 +2636,6 @@ class ResultPanel(QWidget):
             return self.summary_box.toPlainText()
         if current_tab == 3:
             return self.tone_box.toPlainText()
+        if current_tab == 4:
+            return self.beta_box.toPlainText()
         return ""

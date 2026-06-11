@@ -5,8 +5,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from client.ui.main_window import App
+from client.ui.dpi import configure_high_dpi
 
 if __name__ == "__main__":
+    configure_high_dpi()
+    from client.ui.main_window import App
+
     app = App()
     app.start()

@@ -1,14 +1,19 @@
 from sqlalchemy import Boolean, Column, Integer, String, Text, ForeignKey, DateTime, UniqueConstraint
 from sqlalchemy.orm import relationship
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from database import Base
 
 
-_KST = ZoneInfo("Asia/Seoul")
+try:
+    _KST = ZoneInfo("Asia/Seoul")
+except ZoneInfoNotFoundError:
+    _KST = None
 
 def local_now():
+    if _KST is None:
+        return datetime.now()
     return datetime.now(_KST).replace(tzinfo=None)
 
 

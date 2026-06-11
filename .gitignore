@@ -1,0 +1,13 @@
+.logs/
+__pycache__/
+*.pyc
+
+server/.env
+server/app.db
+user_settings.json
+
+.agents/
+.codex/
+server/.env
+.env
+.env.*

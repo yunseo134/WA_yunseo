@@ -1,6 +1,7 @@
 {
   "default_dark_mode": false,
-  "input_mode": "drag",
-  "replace_mode": false,
-  "history_enabled": true
+  "input_mode": "realtime",
+  "replace_mode": true,
+  "history_enabled": true,
+  "beta_enabled": true
 }

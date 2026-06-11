@@ -3498,3 +3498,56 @@
 2026-06-02 11:43:35 marker_replace_start mode='notepad_selection' start=17 end=23 source_len=23 original='다시 만너요' replacement='다시 만나요'
 2026-06-02 11:43:36 marker_replace_overlay_sync synced=True text_len=23
 2026-06-02 11:43:36 marker_replace_success live_start=17 live_end=23
+2026-06-05 05:03:20 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:20 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:20 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:21 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:21 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:21 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:27 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:27 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:28 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:41 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:41 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:42 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:44 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:44 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:44 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:51 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:51 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:03:51 word_focus_restore_after_overlay hwnd=2428742 restored=False
+2026-06-05 05:23:44 immediate_selection_capture_skipped reason='unsupported_reader' reader='notepad_selection' hwnd=1710304
+2026-06-05 05:23:44 main_correction_pre_show_capture captured=False reader='notepad_selection' hwnd=1710304
+2026-06-05 05:23:44 notepad_focus_restore_after_overlay hwnd=1710304 restored=True
+2026-06-05 05:23:44 notepad_focus_restore_after_overlay hwnd=1710304 restored=True
+2026-06-05 05:23:45 notepad_focus_restore_after_overlay hwnd=1710304 restored=True
+2026-06-05 05:23:46 apply_pressed has_target=False input_len=0 retry=False snapshot=False
+2026-06-05 05:23:46 immediate_selection_capture_skipped reason='unsupported_reader' reader='notepad_selection' hwnd=1710304
+2026-06-05 05:23:46 apply_immediate_capture_check captured=False
+2026-06-05 05:23:46 apply_restore_check restored=False
+2026-06-05 05:23:46 apply_pressed has_target=False input_len=0 retry=True snapshot=False
+2026-06-05 05:23:46 immediate_selection_capture_skipped reason='unsupported_reader' reader='notepad_selection' hwnd=1710304
+2026-06-05 05:23:46 apply_immediate_capture_check captured=False
+2026-06-05 05:23:46 apply_restore_check restored=False
+2026-06-05 05:23:48 notepad_focus_restore_after_overlay hwnd=1710304 restored=True
+2026-06-05 05:23:48 notepad_focus_restore_after_overlay hwnd=1710304 restored=True
+2026-06-05 05:23:48 notepad_focus_restore_after_overlay hwnd=1710304 restored=True
+2026-06-05 05:23:49 notepad_focus_restore_after_overlay hwnd=1710304 restored=True
+2026-06-05 05:23:49 notepad_focus_restore_after_overlay hwnd=1710304 restored=True
+2026-06-05 05:23:50 notepad_focus_restore_after_overlay hwnd=1710304 restored=True
+2026-06-05 05:24:28 apply_pressed has_target=False input_len=0 retry=False snapshot=False
+2026-06-05 05:24:28 immediate_selection_capture_skipped reason='unsupported_reader' reader='notepad_selection' hwnd=1710304
+2026-06-05 05:24:28 apply_immediate_capture_check captured=False
+2026-06-05 05:24:28 apply_restore_check restored=False
+2026-06-05 05:24:28 apply_pressed has_target=False input_len=0 retry=True snapshot=False
+2026-06-05 05:24:28 immediate_selection_capture_skipped reason='unsupported_reader' reader='notepad_selection' hwnd=1710304
+2026-06-05 05:24:28 apply_immediate_capture_check captured=False
+2026-06-05 05:24:28 apply_restore_check restored=False
+2026-06-05 05:24:30 apply_pressed has_target=False input_len=0 retry=False snapshot=False
+2026-06-05 05:24:30 immediate_selection_capture_skipped reason='unsupported_reader' reader='notepad_selection' hwnd=1710304
+2026-06-05 05:24:30 apply_immediate_capture_check captured=False
+2026-06-05 05:24:30 apply_restore_check restored=False
+2026-06-05 05:24:30 apply_pressed has_target=False input_len=0 retry=True snapshot=False
+2026-06-05 05:24:30 immediate_selection_capture_skipped reason='unsupported_reader' reader='notepad_selection' hwnd=1710304
+2026-06-05 05:24:30 apply_immediate_capture_check captured=False
+2026-06-05 05:24:30 apply_restore_check restored=False
